@@ -23,6 +23,8 @@ import org.apache.calcite.plan.AbstractRelOptPlanner;
 import org.apache.calcite.plan.Context;
 import org.apache.calcite.plan.Convention;
 import org.apache.calcite.plan.ConventionTraitDef;
+import org.apache.calcite.plan.MulticastRelOptListener;
+import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptCost;
 import org.apache.calcite.plan.RelOptCostFactory;
 import org.apache.calcite.plan.RelOptLattice;
@@ -39,6 +41,8 @@ import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.plan.RelTrait;
 import org.apache.calcite.plan.RelTraitDef;
 import org.apache.calcite.plan.RelTraitSet;
+import org.apache.calcite.plan.tvr.TvrSemantics;
+import org.apache.calcite.plan.volcano.TvrMetaSet.TvrConvertMatchPattern;
 import org.apache.calcite.prepare.CalcitePrepareImpl;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.RelVisitor;
@@ -69,6 +73,8 @@ import org.apache.calcite.util.SaffronProperties;
 import org.apache.calcite.util.Util;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.LinkedHashMultimap;
 import com.google.common.collect.LinkedListMultimap;
 import com.google.common.collect.Multimap;
@@ -79,19 +85,26 @@ import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Deque;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Predicate;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+import static java.util.stream.Collectors.joining;
 
 /**
  * VolcanoPlanner optimizes queries by transforming expressions selectively
@@ -101,6 +114,9 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
   //~ Static fields/initializers ---------------------------------------------
 
   protected static final double COST_IMPROVEMENT = .5;
+
+  protected EnumSet<VolcanoPlannerPhase> phasesToDrainTvrConverters =
+      EnumSet.of(VolcanoPlannerPhase.values()[0]);
 
   //~ Instance fields --------------------------------------------------------
 
@@ -140,10 +156,28 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
   private final Multimap<Class<? extends RelNode>, RelOptRuleOperand>
       classOperands = LinkedListMultimap.create();
 
+  private final Set<Class<? extends TvrSemantics>> knownTvrEdgeClasses =
+      new LinkedHashSet<>();
+  private final Set<Class<? extends TvrProperty>> knownTvrPropertyClasses =
+      new LinkedHashSet<>();
+
+  private final Set<TvrRelOptRuleOperand> tvrOperands = new LinkedHashSet<>();
+  private final Multimap<Class<? extends TvrSemantics>,
+      TvrEdgeRelOptRuleOperand>
+      tvrEdgeToOperands = LinkedListMultimap.create();
+  private final Multimap<Class<? extends TvrProperty>,
+      TvrPropertyEdgeRuleOperand>
+      tvrPropertyEdgeToOperands = LinkedListMultimap.create();
+
+  private final Multimap<Class<? extends TvrSemantics>, TvrConvertMatchPattern>
+      tvrConvertMatchPatterns = LinkedListMultimap.create();
+
+  private final Set<TvrMetaSet> hasDelayedTvrConverters = new LinkedHashSet<>();
+
   /**
    * List of all sets. Used only for debugging.
    */
-  final List<RelSet> allSets = new ArrayList<>();
+  protected final List<RelSet> allSets = new ArrayList<>();
 
   /**
    * Canonical map from {@link String digest} to the unique
@@ -182,10 +216,15 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
    */
   final Map<RelNode, Double> relImportances = new HashMap<>();
 
+  public static final double DEFAULT_REL_IMPORTANCE = 1.0d;
+
+  protected final SetMultimap<RelNode, TvrMetaSetType> tvrGenericRels =
+      LinkedHashMultimap.create();
+
   /**
    * List of all schemas which have been registered.
    */
-  private final Set<RelOptSchema> registeredSchemas = new HashSet<>();
+  public final Set<RelOptSchema> registeredSchemas = new HashSet<>();
 
   /**
    * Holds rule calls waiting to be fired.
@@ -286,9 +325,8 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
       getPhaseRuleMappingInitializer() {
     return phaseRuleMap -> {
       // Disable all phases except OPTIMIZE by adding one useless rule name.
-      phaseRuleMap.get(VolcanoPlannerPhase.PRE_PROCESS_MDR).add("xxx");
-      phaseRuleMap.get(VolcanoPlannerPhase.PRE_PROCESS).add("xxx");
-      phaseRuleMap.get(VolcanoPlannerPhase.CLEANUP).add("xxx");
+      Arrays.stream(VolcanoPlannerPhase.values()).skip(1)
+          .forEach(phase -> phaseRuleMap.get(phase).add("xxx"));
     };
   }
 
@@ -303,12 +341,15 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
     // So now is a good time to tell the metadata layer what to expect.
     registerMetadataRels();
 
-    this.root = registerImpl(rel, null);
     if (this.originalRoot == null) {
       this.originalRoot = rel;
+      this.originalRootString =
+          RelOptUtil.toString(rel, SqlExplainLevel.ALL_ATTRIBUTES);
     }
-    this.originalRootString =
-        RelOptUtil.toString(root, SqlExplainLevel.ALL_ATTRIBUTES);
+
+    this.root =
+        registerAsTvrGeneric(rel, ImmutableSet.of(TvrMetaSetType.DEFAULT),
+            ImmutableMap.of());
 
     // Making a node the root changes its importance.
     this.ruleQueue.recompute(this.root);
@@ -431,6 +472,10 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
       removeRule(rule);
     }
     this.classOperands.clear();
+    this.tvrOperands.clear();
+    this.tvrEdgeToOperands.clear();
+    this.tvrPropertyEdgeToOperands.clear();
+    this.tvrConvertMatchPatterns.clear();
     this.allSets.clear();
     this.mapDigestToRel.clear();
     this.mapRel2Subset.clear();
@@ -439,6 +484,8 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
     this.ruleNames.clear();
     this.materializations.clear();
     this.latticeByName.clear();
+    this.root = null;
+    this.originalRoot = null;
   }
 
   public List<RelOptRule> getRules() {
@@ -471,10 +518,35 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
     // Register each operand against all concrete sub-classes that could match
     // it.
     for (RelOptRuleOperand operand : rule.getOperands()) {
-      for (Class<? extends RelNode> subClass
-          : subClasses(operand.getMatchedClass())) {
-        classOperands.put(subClass, operand);
+      if (operand instanceof TvrRelOptRuleOperand) {
+        tvrOperands.add((TvrRelOptRuleOperand) operand);
+      } else if (operand instanceof TvrEdgeRelOptRuleOperand) {
+        TvrEdgeRelOptRuleOperand op = (TvrEdgeRelOptRuleOperand) operand;
+        Iterable<Class<? extends TvrSemantics>> subClasses =
+            Util.filter(knownTvrEdgeClasses,
+                op.getMatchedTvrClass()::isAssignableFrom);
+        subClasses.forEach(c -> tvrEdgeToOperands.put(c, op));
+      } else if (operand instanceof TvrPropertyEdgeRuleOperand) {
+        TvrPropertyEdgeRuleOperand op = (TvrPropertyEdgeRuleOperand) operand;
+        Iterable<Class<? extends TvrProperty>> subClasses =
+            Util.filter(knownTvrPropertyClasses,
+                op.getMatchedPropertyClass()::isAssignableFrom);
+        subClasses.forEach(c -> tvrPropertyEdgeToOperands.put(c, op));
+      } else {
+        for (Class<? extends RelNode> subClass : subClasses(
+            operand.getMatchedClass())) {
+          classOperands.put(subClass, operand);
+        }
       }
+    }
+
+    if (rule instanceof TvrConvertMatchPattern) {
+      TvrConvertMatchPattern pattern = (TvrConvertMatchPattern) rule;
+      pattern.getRelatedTvrClasses().forEach(clazz -> {
+        Iterable<Class<? extends TvrSemantics>> subClasses =
+            Util.filter(knownTvrEdgeClasses, clazz::isAssignableFrom);
+        subClasses.forEach(c -> tvrConvertMatchPatterns.put(c, pattern));
+      });
     }
 
     // If this is a converter rule, check that it operates on one of the
@@ -539,6 +611,50 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
     }
   }
 
+  public void registerTvrEdgeClass(TvrSemantics tvrKey) {
+    Class<? extends TvrSemantics> clazz = tvrKey.getClass();
+    if (knownTvrEdgeClasses.add(clazz)) {
+      // Create mappings to existing rule operands for this new class
+      for (RelOptRule rule : ruleSet) {
+        for (RelOptRuleOperand operand : rule.getOperands()) {
+          if (!(operand instanceof TvrEdgeRelOptRuleOperand)) {
+            continue;
+          }
+          TvrEdgeRelOptRuleOperand op = (TvrEdgeRelOptRuleOperand) operand;
+          if (op.getMatchedTvrClass().isAssignableFrom(clazz)) {
+            tvrEdgeToOperands.put(clazz, op);
+          }
+        }
+
+        if (rule instanceof TvrConvertMatchPattern) {
+          TvrConvertMatchPattern pattern = (TvrConvertMatchPattern) rule;
+          if (pattern.getRelatedTvrClasses().stream()
+              .anyMatch(cl -> cl.isAssignableFrom(clazz))) {
+            tvrConvertMatchPatterns.put(clazz, pattern);
+          }
+        }
+      }
+    }
+  }
+
+  public void registerTvrPropertyClass(TvrProperty tvrProperty) {
+    Class<? extends TvrProperty> clazz = tvrProperty.getClass();
+    if (knownTvrPropertyClasses.add(clazz)) {
+      // Create mappings to existing rule operands for this new class
+      for (RelOptRule rule : ruleSet) {
+        for (RelOptRuleOperand operand : rule.getOperands()) {
+          if (!(operand instanceof TvrPropertyEdgeRuleOperand)) {
+            continue;
+          }
+          TvrPropertyEdgeRuleOperand op = (TvrPropertyEdgeRuleOperand) operand;
+          if (op.getMatchedPropertyClass().isAssignableFrom(clazz)) {
+            tvrPropertyEdgeToOperands.put(clazz, op);
+          }
+        }
+      }
+    }
+  }
+
   public RelNode changeTraits(final RelNode rel, RelTraitSet toTraits) {
     assert !rel.getTraitSet().equals(toTraits);
     assert toTraits.allSimple();
@@ -549,6 +665,100 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
     }
 
     return rel2.set.getOrCreateSubset(rel.getCluster(), toTraits.simplify());
+  }
+
+  private RelSubset registerOneLevelWithTvrTypes(RelNode newRel, RelNode equiv,
+      Set<TvrMetaSetType> tvrTypes) {
+    // Update the relNode with registered inputs and recompute digest
+    RelNode rel = newRel.onRegister(this);
+    // Remember the equiv nodes that's already registered if any. This equiv
+    // node ('s input) might change as a result of set merge when we register
+    // below
+    RelNode oldEquivExp = mapDigestToRel.get(key(rel));
+
+    assert rel.getInputs().stream()
+        .allMatch(input -> input instanceof RelSubset);
+    RelSubset subset = ensureRegistered(rel, equiv);
+
+    if (!tvrTypes.isEmpty()) {
+      if (!(newRel instanceof RelSubset)) {
+        // Find the registered relNode and remember the generic tvr types
+        RelNode equivExp;
+        if (oldEquivExp == null) {
+          equivExp = mapDigestToRel.get(key(rel));
+        } else {
+          // oldEquivExp's input might have changed and oldEquivExp might
+          // have been discarded as a result of merge
+          equivExp = mapDigestToRel.get(key(oldEquivExp));
+        }
+        assert equivExp != null;
+
+        // add all new tvrTypes
+        boolean setChanged = tvrGenericRels.putAll(equivExp, tvrTypes);
+
+        // fire rules as a rel is newly registered as a Tvr generic rel
+        if (setChanged) {
+          fireRules(equivExp, true);
+        }
+      }
+      // Make the RelSet a TvrRelSet of the requested types
+      subset.set.makeTvrSetIfPossible(this, tvrTypes);
+    }
+    return subset;
+  }
+
+  /**
+   * Register a relNode (and its unregistered children) and connect them to new
+   * tvrs of given types. If tvrTypes is empty, no new tvr is created, meaning
+   * the relNode is not generic to any tvr.
+   *
+   * This is similar to ensureRegistered, but with added tvrType handling.
+   * We keep it a separate api so that register api remains unchanged.
+   */
+  public RelSubset registerAsTvrGeneric(RelNode rel,
+      Set<TvrMetaSetType> tvrTypes, Map<RelNode, RelNode> equiv) {
+    if (rel instanceof RelSubset || isRegistered(rel)) {
+      return registerOneLevelWithTvrTypes(rel, equiv.get(rel), tvrTypes);
+    }
+    // Register inputs as generic recursively first
+    for (RelNode input : rel.getInputs()) {
+      registerAsTvrGeneric(input, tvrTypes, equiv);
+    }
+    return registerOneLevelWithTvrTypes(rel, equiv.get(rel), tvrTypes);
+  }
+
+  public RelNode getOrCreateSetFromTvrSet(RelNode rel, TvrMetaSetType tvrType,
+      TvrSemantics toTvrKey, RelDataType newSetRowType, RelTraitSet toTraits) {
+    RelSubset rel2 =
+        registerAsTvrGeneric(rel, ImmutableSet.of(tvrType), ImmutableMap.of());
+    TvrMetaSet tvr = getSet(rel2).getTvrForTvrSet(tvrType);
+    return getOrCreateSetForTvr(rel.getCluster(), tvr, toTvrKey, newSetRowType,
+        toTraits);
+  }
+
+  public RelNode getOrCreateSetForTvr(RelOptCluster cluster, TvrMetaSet tvr,
+      TvrSemantics toTvrKey, RelDataType newSetRowType, RelTraitSet toTraits) {
+    // Find or create the RelSet we are looking for
+    RelSet set = tvr.getRelSet(toTvrKey);
+    if (set == null) {
+      // TvrRelSet should not be created this way
+      assert toTvrKey != TvrSemantics.SET_SNAPSHOT_MAX;
+
+      // Create a non-Tvr RelSet for the TvrMetaSet
+      set = new RelSet(nextSetId++, new HashSet<>(), new HashSet<>(), cluster,
+          newSetRowType);
+      this.allSets.add(set);
+
+      set.addTvrLink(this, null, toTvrKey, tvr);
+      LOGGER.debug("Empty set " + set.id + " with TvrSemantic " + toTvrKey
+          + " created for tvr " + tvr.getTvrId());
+    }
+    return set.getOrCreateSubset(cluster, toTraits);
+  }
+
+  public Collection<TvrConvertMatchPattern> getTvrConvertMatchPatterns(
+      TvrSemantics newTrait) {
+    return tvrConvertMatchPatterns.get(newTrait.getClass());
   }
 
   public RelOptPlanner chooseDelegate() {
@@ -590,6 +800,7 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
     registerMaterializations();
     int cumulativeTicks = 0;
     for (VolcanoPlannerPhase phase : VolcanoPlannerPhase.values()) {
+      prePhase(phase);
       setInitialImportance();
 
       RelOptCost targetCost = costFactory.makeHugeCost();
@@ -641,7 +852,14 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
 
         VolcanoRuleMatch match = ruleQueue.popMatch(phase);
         if (match == null) {
-          break;
+          // RuleQueue is empty, create delayed TvrTrait one at a time
+          LOGGER.debug("RuleQueue drained, creating delayed tvr converters");
+          if (phasesToDrainTvrConverters.contains(phase)
+              && createOneDelayedTvrConverter()) {
+            continue; // Continue looping
+          } else {
+            break;    // Exit when delayCreateTvrTraits is also drained
+          }
         }
 
         assert match.getRule().matches(match);
@@ -653,6 +871,7 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
       }
 
       ruleQueue.phaseCompleted(phase);
+      postPhase(phase);
     }
     if (LOGGER.isTraceEnabled()) {
       StringWriter sw = new StringWriter();
@@ -669,6 +888,35 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
       LOGGER.debug("Provenance:\n{}", provenance(cheapest));
     }
     return cheapest;
+  }
+
+  protected void postPhase(VolcanoPlannerPhase phase) {
+  }
+
+  protected void prePhase(VolcanoPlannerPhase phase) {
+  }
+
+  private boolean createOneDelayedTvrConverter() {
+    Iterator<TvrMetaSet> iter = hasDelayedTvrConverters.iterator();
+    while (iter.hasNext()) {
+      TvrMetaSet tvrMetaSet = iter.next();
+      if (tvrMetaSet.delayedTvrConverters.isEmpty()) {
+        iter.remove();
+        continue;
+      }
+      if (tvrMetaSet.createDelayedTvrConverter(this)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  public void trackMetaSetWithDelayedTvrConverters(TvrMetaSet tvr) {
+    hasDelayedTvrConverters.add(tvr);
+  }
+
+  public void untrackMetaSetWithDelayedTvrConverters(TvrMetaSet tvr) {
+    hasDelayedTvrConverters.remove(tvr);
   }
 
   /** Informs {@link JaninoRelMetadataProvider} about the different kinds of
@@ -1006,9 +1254,10 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
   public RelSubset getSubset(RelNode rel) {
     assert rel != null : "pre: rel != null";
     if (rel instanceof RelSubset) {
-      return (RelSubset) rel;
+      return canonize((RelSubset) rel);
     } else {
-      return mapRel2Subset.get(rel);
+      RelSubset s = mapRel2Subset.get(rel);
+      return s == null ? null : canonize(s);
     }
   }
 
@@ -1033,6 +1282,13 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
       return set.getOrCreateSubset(rel.getCluster(), traits);
     }
     return set.getSubset(traits);
+  }
+
+  public List<RelNode> getRelList() {
+    return mapDigestToRel.values().stream().filter(rel -> {
+      Double importance = relImportances.get(rel);
+      return importance == null || importance != 0d;
+    }).collect(Collectors.toList());
   }
 
   private RelNode changeTraitsUsingConverters(
@@ -1188,9 +1444,12 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
 
   public void setImportance(RelNode rel, double importance) {
     assert rel != null;
-    if (importance == 0d) {
-      relImportances.put(rel, importance);
-    }
+    assert importance >= 0d;
+    relImportances.put(rel, importance);
+  }
+
+  public Set<TvrMetaSetType> getGenericRelTvrTypes(RelNode rel) {
+    return tvrGenericRels.get(rel);
   }
 
   /**
@@ -1206,8 +1465,13 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
     pw.println("Sets:");
     Ordering<RelSet> ordering = Ordering.from((o1, o2) -> o1.id - o2.id);
     for (RelSet set : ordering.immutableSortedCopy(allSets)) {
-      pw.println("Set#" + set.id
-          + ", type: " + set.subsets.get(0).getRowType());
+      pw.println(
+          "Set#" + set.id + ", type: " + set.subsets.get(0).getRowType());
+      pw.println("\t" + set.tvrLinks.asMap().entrySet().stream().
+          map(e -> e.getKey() + "-[" + e.getValue().stream()
+              .map(metaSet -> Integer.toString(metaSet.tvrId))
+              .collect(joining(",")) + "]").collect(joining(", ")));
+
       int j = -1;
       for (RelSubset subset : set.subsets) {
         ++j;
@@ -1357,6 +1621,56 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
   }
 
   /**
+   * Update relNode related information when two identical relNodes are
+   * de-duped.
+   */
+  void mergeIdenticalRels(RelNode to, RelNode from) {
+    // Merge the generic map entries
+    if (tvrGenericRels.containsKey(from)) {
+      tvrGenericRels.putAll(to, tvrGenericRels.get(from));
+    }
+
+    RelSubset equivRelSubset = getSubset(to);
+    ruleQueue.recompute(equivRelSubset, true);
+
+    // update the importance of the surviving relNode to the merged
+    // importance, which is the smaller value of the two.
+    if (isSelfLoop(to)) {
+      setImportance(to, 0d);
+      return;
+    }
+    Double fromImportance = relImportances.get(from);
+    Double toImportance = relImportances.get(to);
+    if (fromImportance == null) {
+      if (toImportance == null) {
+        return; // both using default importance
+      }
+      if (toImportance > DEFAULT_REL_IMPORTANCE) {
+        relImportances.remove(to);  // merge to default
+      }
+      return;
+    }
+    if (toImportance == null) {
+      if (fromImportance < DEFAULT_REL_IMPORTANCE) {
+        relImportances.put(to, fromImportance); // use smaller value
+      }
+      return;
+    }
+    // use the smaller value
+    relImportances.put(to,
+        (fromImportance < toImportance) ? fromImportance : toImportance);
+  }
+
+  /**
+   * Whether the rel is one of its own inputs, if true, this relNode is
+   * useless.
+   */
+  boolean isSelfLoop(RelNode rel) {
+    RelSubset subset = getSubset(rel);
+    return rel.getInputs().contains(subset);
+  }
+
+  /**
    * If a subset has one or more equivalent subsets (owing to a set having
    * merged with another), returns the subset which is the leader of the
    * equivalence class.
@@ -1384,10 +1698,18 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
    * @param deferred If true, each time a rule matches, just add an entry to
    *                 the queue.
    */
-  void fireRules(
+  protected void fireRules(
       RelNode rel,
       boolean deferred) {
     for (RelOptRuleOperand operand : classOperands.get(rel.getClass())) {
+      if (!ruleQueue.active(operand.getRule())) {
+        continue;
+      }
+      if (rel instanceof RelSubset
+          && operand.getMatchedClass() != RelSubset.class) {
+        // Operand has to be look for exactly RelSubset.class to match a subset
+        continue;
+      }
       if (operand.matches(rel)) {
         final VolcanoRuleCall ruleCall;
         if (deferred) {
@@ -1396,6 +1718,57 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
           ruleCall = new VolcanoRuleCall(this, operand);
         }
         ruleCall.match(rel);
+      }
+    }
+  }
+
+  void fireRules(TvrMetaSet tvr) {
+    for (TvrRelOptRuleOperand tvrOp : tvrOperands) {
+      if (!ruleQueue.active(tvrOp.getRule())) {
+        continue;
+      }
+      if (tvrOp.matches(tvr)) {
+        final VolcanoRuleCall ruleCall;
+        ruleCall = new DeferringRuleCall(this, tvrOp);
+        ruleCall.match(tvr);
+      }
+    }
+  }
+
+  void fireRules(TvrMetaSet tvr, TvrSemantics tvrKey, RelSet set,
+      boolean deferred) {
+    for (TvrEdgeRelOptRuleOperand edgeOp : tvrEdgeToOperands
+        .get(tvrKey.getClass())) {
+      if (!ruleQueue.active(edgeOp.getRule())) {
+        continue;
+      }
+      if (edgeOp.matches(tvrKey)) {
+        final VolcanoRuleCall ruleCall;
+        if (deferred) {
+          ruleCall = new DeferringRuleCall(this, edgeOp);
+        } else {
+          ruleCall = new VolcanoRuleCall(this, edgeOp);
+        }
+        ruleCall.match(tvr, tvrKey, set);
+      }
+    }
+  }
+
+  void fireRules(TvrMetaSet fromTvr, TvrMetaSet toTvr, TvrProperty tvrProperty,
+      boolean deferred) {
+    for (TvrPropertyEdgeRuleOperand propertyOp : tvrPropertyEdgeToOperands
+        .get(tvrProperty.getClass())) {
+      if (!ruleQueue.active(propertyOp.getRule())) {
+        continue;
+      }
+      if (propertyOp.matches(tvrProperty)) {
+        final VolcanoRuleCall ruleCall;
+        if (deferred) {
+          ruleCall = new DeferringRuleCall(this, propertyOp);
+        } else {
+          ruleCall = new VolcanoRuleCall(this, propertyOp);
+        }
+        ruleCall.match(fromTvr, toTvr, tvrProperty);
       }
     }
   }
@@ -1422,7 +1795,7 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
     return changeCount > 0;
   }
 
-  private RelSet merge(RelSet set, RelSet set2) {
+  RelSet merge(RelSet set, RelSet set2) {
     assert set != set2 : "pre: set != set2";
 
     // Find the root of set2's equivalence tree.
@@ -1456,10 +1829,17 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
       ensureRootConverters();
     }
 
+    // find the relnode self loop after set merge and set its importance to be 0
+    for (RelNode rel : set.rels) {
+      if (isSelfLoop(rel)) {
+        setImportance(rel, 0d);
+      }
+    }
+
     return set;
   }
 
-  private static RelSet equivRoot(RelSet s) {
+  public static RelSet equivRoot(RelSet s) {
     RelSet p = s; // iterates at twice the rate, to detect cycles
     while (s.equivalentSet != null) {
       p = forward2(s, p);
@@ -1497,9 +1877,7 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
    * @param set set that rel belongs to, or <code>null</code>
    * @return the equivalence-set
    */
-  private RelSubset registerImpl(
-      RelNode rel,
-      RelSet set) {
+  RelSubset registerImpl(RelNode rel, RelSet set) {
     if (rel instanceof RelSubset) {
       return registerSubset(set, (RelSubset) rel);
     }
@@ -1604,12 +1982,9 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
 
     // Place the expression in the appropriate equivalence set.
     if (set == null) {
-      set = new RelSet(
-          nextSetId++,
-          Util.minus(
-              RelOptUtil.getVariablesSet(rel),
-              rel.getVariablesSet()),
-          RelOptUtil.getVariablesUsed(rel));
+      set = new RelSet(nextSetId++,
+          Util.minus(RelOptUtil.getVariablesSet(rel), rel.getVariablesSet()),
+          RelOptUtil.getVariablesUsed(rel), rel.getCluster(), rel.getRowType());
       this.allSets.add(set);
     }
 
@@ -1623,7 +1998,6 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
     registerClass(rel);
 
     registerCount++;
-    final int subsetBeforeCount = set.subsets.size();
     RelSubset subset = addRelToSet(rel, set);
 
     final RelNode xx = mapDigestToRel.put(key, rel);
@@ -1668,11 +2042,6 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
 
     // Queue up all rules triggered by this relexp's creation.
     fireRules(rel, true);
-
-    // It's a new subset.
-    if (set.subsets.size() > subsetBeforeCount) {
-      fireRules(subset, true);
-    }
 
     return subset;
   }
@@ -1799,13 +2168,12 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
     this.locked = locked;
   }
 
-  public void ensureRegistered(
-      RelNode rel,
-      RelNode equivRel,
+  public RelNode ensureRegistered(RelNode rel, RelNode equivRel,
       VolcanoRuleCall ruleCall) {
     ruleCallStack.push(ruleCall);
-    ensureRegistered(rel, equivRel);
+    RelSubset ret = ensureRegistered(rel, equivRel);
     ruleCallStack.pop();
+    return ret;
   }
 
   //~ Inner Classes ----------------------------------------------------------
@@ -1832,6 +2200,9 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
               volcanoPlanner,
               getOperand0(),
               rels,
+              tvrs,
+              tvrTraits,
+              tvrProperties,
               nodeInputs);
       volcanoPlanner.ruleQueue.addMatch(match);
     }

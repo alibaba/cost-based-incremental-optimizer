@@ -16,10 +16,15 @@
  */
 package org.apache.calcite.plan;
 
+import org.apache.calcite.plan.volcano.RelSubset;
+import org.apache.calcite.plan.volcano.TvrEdgeRelOptRuleOperand;
+import org.apache.calcite.plan.volcano.VolcanoRuleCall.OperandMatch;
+import org.apache.calcite.rel.AbstractRelNode;
 import org.apache.calcite.rel.RelNode;
 
 import com.google.common.collect.ImmutableList;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.function.Predicate;
@@ -38,13 +43,18 @@ import java.util.function.Predicate;
 public class RelOptRuleOperand {
   //~ Instance fields --------------------------------------------------------
 
+  // The parent operand in its operand tree
   private RelOptRuleOperand parent;
+  // Linked to the TvrOperands outside the operand tree
+  // Two identical TvrEdgeRelOptRuleOperand should be treated as different ones
+  public List<TvrEdgeRelOptRuleOperand> tvrParents;
+
   private RelOptRule rule;
   private final Predicate<RelNode> predicate;
 
   // REVIEW jvs 29-Aug-2004: some of these are Volcano-specific and should be
   // factored out
-  public int[] solveOrder;
+  public List<OperandMatch> solveOrder;
   public int ordinalInParent;
   public int ordinalInRule;
   private final RelTrait trait;
@@ -88,22 +98,17 @@ public class RelOptRuleOperand {
     this(clazz, trait, predicate, children.policy, children.operands);
   }
 
-  /** Private constructor.
-   *
-   * <p>Do not call from outside package, and do not create a sub-class.
-   *
-   * <p>The other constructor is deprecated; when it is removed, make fields
-   * {@link #parent}, {@link #ordinalInParent} and {@link #solveOrder} final,
-   * and add constructor parameters for them. See
-   * <a href="https://issues.apache.org/jira/browse/CALCITE-1166">[CALCITE-1166]
-   * Disallow sub-classes of RelOptRuleOperand</a>. */
-  <R extends RelNode> RelOptRuleOperand(
+  protected <R extends RelNode> RelOptRuleOperand(
       Class<R> clazz,
       RelTrait trait,
       Predicate<? super R> predicate,
       RelOptRuleOperandChildPolicy childPolicy,
       ImmutableList<RelOptRuleOperand> children) {
     assert clazz != null;
+    if (clazz == RelSubset.class) {
+      // Only supports matching subset for leaf operand
+      assert children.size() == 0;
+    }
     switch (childPolicy) {
     case ANY:
       break;
@@ -126,6 +131,7 @@ public class RelOptRuleOperand {
       assert child.parent == null : "cannot re-use operands";
       child.parent = this;
     }
+    this.tvrParents = new ArrayList<>();
   }
 
   //~ Methods ----------------------------------------------------------------
@@ -212,6 +218,12 @@ public class RelOptRuleOperand {
       return false;
     }
     return predicate.test(rel);
+  }
+
+  public static class DummyRelNode extends AbstractRelNode {
+    public DummyRelNode() {
+      super(null, null);
+    }
   }
 }
 

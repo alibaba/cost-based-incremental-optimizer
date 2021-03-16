@@ -16,10 +16,16 @@
  */
 package org.apache.calcite.plan;
 
+import com.google.common.collect.ImmutableSet;
+import org.apache.calcite.plan.tvr.TvrSemantics;
+import org.apache.calcite.plan.volcano.TvrMetaSet;
+import org.apache.calcite.plan.volcano.TvrMetaSetType;
+import org.apache.calcite.plan.volcano.TvrProperty;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.Filter;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.tools.RelBuilder;
+import org.apache.calcite.util.Pair;
 import org.apache.calcite.util.trace.CalciteTrace;
 
 import com.google.common.collect.ImmutableList;
@@ -27,9 +33,13 @@ import com.google.common.collect.ImmutableMap;
 
 import org.slf4j.Logger;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * A <code>RelOptRuleCall</code> is an invocation of a {@link RelOptRule} with a
@@ -51,7 +61,35 @@ public abstract class RelOptRuleCall {
   protected final RelOptRuleOperand operand0;
   protected Map<RelNode, List<RelNode>> nodeInputs;
   public final RelOptRule rule;
+
+  /**
+   * Matched RelNodes. Size of rule.getMatchingRelCount(), same order as the
+   * given operand roots, pre-order within each operand root.
+   */
   public final RelNode[] rels;
+
+  /**
+   * Matched TvrMetaSets. Size of rule.getMatchingTvrCount(), same order as the
+   * given tvr operands.
+   */
+  public TvrMetaSet[] tvrs;
+
+  /**
+   * Matched Tvr links between RelNode and TvrMetaSet. Size of
+   * rule.getMatchingTvrEdgeCount(), same order as the given tvr operands,
+   * expanded by the order in which TvrRelOptRuleOperand.addTvrConnection() is
+   * called.
+   */
+  public TvrSemantics[] tvrTraits;
+
+  /**
+   * Matched Tvr Property links between TvrMetaSets. Size of
+   * rule.getMatchingTvrPropertyEdgeCount(), same order as the given tvr
+   * operands, expanded by the order in which TvrRelOptRuleOperand
+   * .addTvrPropertyEdge() is called.
+   */
+  public TvrProperty[] tvrProperties;
+
   private final RelOptPlanner planner;
   private final List<RelNode> parents;
 
@@ -75,6 +113,9 @@ public abstract class RelOptRuleCall {
       RelOptPlanner planner,
       RelOptRuleOperand operand,
       RelNode[] rels,
+      TvrMetaSet[] tvrs,
+      TvrSemantics[] tvrTraits,
+      TvrProperty[] tvrProperties,
       Map<RelNode, List<RelNode>> nodeInputs,
       List<RelNode> parents) {
     this.id = nextId++;
@@ -83,16 +124,24 @@ public abstract class RelOptRuleCall {
     this.nodeInputs = nodeInputs;
     this.rule = operand.getRule();
     this.rels = rels;
+    this.tvrs = tvrs;
+    this.tvrTraits = tvrTraits;
+    this.tvrProperties = tvrProperties;
     this.parents = parents;
-    assert rels.length == rule.operands.size();
+    assert rels.length + tvrs.length + tvrTraits.length + tvrProperties.length
+        == rule.operands.size();
   }
 
   protected RelOptRuleCall(
       RelOptPlanner planner,
       RelOptRuleOperand operand,
       RelNode[] rels,
+      TvrMetaSet[] tvrs,
+      TvrSemantics[] tvrTraits,
+      TvrProperty[] tvrProperties,
       Map<RelNode, List<RelNode>> nodeInputs) {
-    this(planner, operand, rels, nodeInputs, null);
+    this(planner, operand, rels, tvrs, tvrTraits, tvrProperties, nodeInputs,
+        null);
   }
 
   //~ Methods ----------------------------------------------------------------
@@ -209,6 +258,14 @@ public abstract class RelOptRuleCall {
   }
 
   /**
+   * transformTo with the option of adding additional tvr links.
+   */
+  public abstract void transformToWithOutRootEquivalence(
+      Map<RelNode, Set<TvrMetaSetType>> newRels, Map<RelNode, RelNode> equiv,
+      Map<RelNode, Map<TvrSemantics, List<TvrMetaSet>>> tvrUpdates,
+      Map<Pair<RelNode, TvrMetaSetType>, Map<TvrProperty, List<TvrMetaSet>>> tvrPropertyInLinks);
+
+  /**
    * Registers that a rule has produced an equivalent relational expression.
    *
    * <p>Called by the rule whenever it finds a match. The implementation of
@@ -223,7 +280,17 @@ public abstract class RelOptRuleCall {
    *              expression of the rule call, {@code call.rels(0)}
    * @param equiv Map of other equivalences
    */
-  public abstract void transformTo(RelNode rel, Map<RelNode, RelNode> equiv);
+  public void transformTo(RelNode rel, Map<RelNode, RelNode> equiv) {
+    if (equiv == null) {
+      equiv = new HashMap<>();
+    } else {
+      equiv = new HashMap<>(equiv);
+    }
+    // Add the implicit root equivalence
+    equiv.put(rel, rels[0]);
+    transformToWithOutRootEquivalence(ImmutableMap.of(rel, ImmutableSet.of()),
+        equiv, ImmutableMap.of(), ImmutableMap.of());
+  }
 
   /**
    * Registers that a rule has produced an equivalent relational expression,
@@ -241,6 +308,68 @@ public abstract class RelOptRuleCall {
    * such as what implementation of {@link Filter} to create. */
   public RelBuilder builder() {
     return rule.relBuilderFactory.create(rel(0).getCluster(), null);
+  }
+
+  public TransformBuilder transformBuilder() {
+    return new TransformBuilder(this);
+  }
+
+  public static class TransformBuilder {
+    RelOptRuleCall call;
+
+    // LinkedHashMap are used to preserve order
+    Map<RelNode, Set<TvrMetaSetType>> newRels = new LinkedHashMap<>();
+    Map<RelNode, RelNode> equiv = new HashMap<>();
+    Map<RelNode, Map<TvrSemantics, List<TvrMetaSet>>> tvrUpdates =
+        new LinkedHashMap<>();
+    Map<Pair<RelNode, TvrMetaSetType>, Map<TvrProperty, List<TvrMetaSet>>>
+        tvrPropertyInLinks = new LinkedHashMap<>();
+
+    private TransformBuilder(RelOptRuleCall call) {
+      this.call = call;
+    }
+
+    private Set<TvrMetaSetType> addRelInternal(RelNode rel) {
+      return newRels.computeIfAbsent(rel, r -> new LinkedHashSet<>());
+    }
+
+    public TransformBuilder addRel(RelNode rel) {
+      addRelInternal(rel);
+      return this;
+    }
+
+    public TransformBuilder addTvrType(RelNode rel, TvrMetaSetType tvrType) {
+      addRelInternal(rel).add(tvrType);
+      return this;
+    }
+
+    public TransformBuilder addEquiv(RelNode rel, RelNode equivNode) {
+      addRelInternal(rel);
+      equiv.put(rel, equivNode);
+      return this;
+    }
+
+    public TransformBuilder addTvrLink(RelNode rel, TvrSemantics tvrKey,
+        TvrMetaSet tvr) {
+      addRelInternal(rel);
+      tvrUpdates.computeIfAbsent(rel, r -> new LinkedHashMap<>())
+          .computeIfAbsent(tvrKey, r -> new ArrayList<>()).add(tvr);
+      return this;
+    }
+
+    public TransformBuilder addPropertyLink(TvrMetaSet fromTvr,
+        TvrProperty tvrProperty, RelNode rel, TvrMetaSetType tvrType) {
+      addTvrType(rel, tvrType);
+      tvrPropertyInLinks
+          .computeIfAbsent(Pair.of(rel, tvrType), r -> new LinkedHashMap<>())
+          .computeIfAbsent(tvrProperty, r -> new ArrayList<>()).add(fromTvr);
+      return this;
+    }
+
+    public void transform() {
+      call.transformToWithOutRootEquivalence(newRels, equiv, tvrUpdates,
+          tvrPropertyInLinks);
+    }
   }
 }
 

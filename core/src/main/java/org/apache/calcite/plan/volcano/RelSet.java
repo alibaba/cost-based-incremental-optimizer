@@ -16,15 +16,23 @@
  */
 package org.apache.calcite.plan.volcano;
 
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.LinkedHashMultimap;
+import com.google.common.collect.SetMultimap;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptListener;
 import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.plan.RelTrait;
 import org.apache.calcite.plan.RelTraitDef;
 import org.apache.calcite.plan.RelTraitSet;
+import org.apache.calcite.plan.tvr.TvrSemantics;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.CorrelationId;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
+import org.apache.calcite.rel.type.RelDataType;
+import org.apache.calcite.util.Litmus;
+import org.apache.calcite.util.Pair;
 import org.apache.calcite.util.trace.CalciteTrace;
 
 import com.google.common.collect.ImmutableList;
@@ -34,9 +42,13 @@ import org.slf4j.Logger;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
+
+import static org.apache.calcite.plan.volcano.VolcanoPlanner.equivRoot;
 
 /**
  * A <code>RelSet</code> is an equivalence-set of expressions; that is, a set of
@@ -46,7 +58,7 @@ import java.util.Set;
  * <p>All of the expressions in an <code>RelSet</code> have the same calling
  * convention.</p>
  */
-class RelSet {
+public class RelSet {
   //~ Static fields/initializers ---------------------------------------------
 
   private static final Logger LOGGER = CalciteTrace.getPlannerTracer();
@@ -74,6 +86,7 @@ class RelSet {
    */
   RelSet equivalentSet;
   RelNode rel;
+  RelDataType rowType;
 
   /**
    * Variables that are set by relational expressions in this set
@@ -92,18 +105,34 @@ class RelSet {
    */
   boolean inMetadataQuery;
 
+  /**
+   * Links to all TvrMetaSets this RelSet belongs to.
+   */
+  SetMultimap<TvrSemantics, TvrMetaSet> tvrLinks;
+
+  RelOptCluster cluster;
+
   //~ Constructors -----------------------------------------------------------
 
-  RelSet(
-      int id,
-      Set<CorrelationId> variablesPropagated,
-      Set<CorrelationId> variablesUsed) {
+  RelSet(int id, Set<CorrelationId> variablesPropagated,
+      Set<CorrelationId> variablesUsed, RelOptCluster cluster,
+      RelDataType rowType) {
     this.id = id;
     this.variablesPropagated = variablesPropagated;
     this.variablesUsed = variablesUsed;
+    this.tvrLinks = LinkedHashMultimap.create();
+    this.cluster = cluster;
+    this.rowType = rowType;
   }
 
   //~ Methods ----------------------------------------------------------------
+
+  public RelDataType getRowType() {
+    if (rowType == null) {
+      rowType = rel.getRowType();
+    }
+    return rowType;
+  }
 
   /**
    * Returns all of the {@link RelNode}s which reference {@link RelNode}s in
@@ -121,6 +150,10 @@ class RelSet {
     return rels;
   }
 
+  public List<RelSubset> getSubsets() {
+    return subsets;
+  }
+
   public RelSubset getSubset(RelTraitSet traits) {
     for (RelSubset subset : subsets) {
       if (subset.getTraitSet().equals(traits)) {
@@ -128,6 +161,11 @@ class RelSet {
       }
     }
     return null;
+  }
+
+  @Override
+  public String toString() {
+    return "set#" + this.id;
   }
 
   /**
@@ -246,6 +284,9 @@ class RelSet {
       if (planner.listener != null) {
         postEquivalenceEvent(planner, subset);
       }
+
+      // Fire rules upon subset creation
+      planner.fireRules(subset, true);
     }
     return subset;
   }
@@ -284,10 +325,9 @@ class RelSet {
       this.rel = rel;
     } else {
       // Row types must be the same, except for field names.
-      RelOptUtil.verifyTypeEquivalence(
-          this.rel,
-          rel,
-          this);
+      assert RelOptUtil
+          .equal("RelSet's rowType", getRowType(), "new rel", rel.getRowType(),
+              Litmus.THROW);
     }
   }
 
@@ -313,7 +353,7 @@ class RelSet {
     assert otherSet.equivalentSet == null;
     LOGGER.trace("Merge set#{} into set#{}", otherSet.id, id);
     otherSet.equivalentSet = this;
-    RelMetadataQuery mq = rel.getCluster().getMetadataQuery();
+    RelMetadataQuery mq = cluster.getMetadataQuery();
 
     // remove from table
     boolean existed = planner.allSets.remove(otherSet);
@@ -332,13 +372,19 @@ class RelSet {
       if (otherSubset.bestCost.isLt(subset.bestCost)) {
         changedSubsets.put(subset, otherSubset.best);
       }
-      for (RelNode otherRel : otherSubset.getRels()) {
-        planner.reregister(this, otherRel);
-      }
+    }
+
+    for (RelNode otherRel : otherSet.rels) {
+      planner.reregister(this, otherRel);
     }
 
     // Has another set merged with this?
     assert equivalentSet == null;
+
+    // Update tvr links between these two RelSets
+    updateTvrForMergingSets(otherSet, planner);
+
+    LOGGER.trace("tvr: done merging set#{} into set#{}", otherSet.id, id);
 
     // calls propagateCostImprovements() for RelSubset instances,
     // whose best should be changed to check whether that
@@ -356,8 +402,8 @@ class RelSet {
     // fact that the child has been renamed.
     //
     // Copy array to prevent ConcurrentModificationException.
-    final List<RelNode> previousParents =
-        ImmutableList.copyOf(otherSet.getParentRels());
+    final Set<RelNode> previousParents =
+        ImmutableSet.copyOf(otherSet.getParentRels());
     for (RelNode parentRel : previousParents) {
       planner.rename(parentRel);
     }
@@ -387,6 +433,153 @@ class RelSet {
       assert planner.getSet(rel) == this;
       planner.fireRules(rel, true);
     }
+    // Fire rule match on subsets as well
+    for (RelSubset subset : subsets) {
+      planner.fireRules(subset, true);
+    }
+  }
+
+  public boolean hasTvrLink() {
+    return tvrLinks.size() != 0;
+  }
+
+  public SetMultimap<TvrSemantics, TvrMetaSet> getTvrLinks() {
+    return tvrLinks;
+  }
+
+  public Map<TvrMetaSetType, TvrMetaSet> getAllMaxTvrTypeMap() {
+    Set<TvrMetaSet> tvrs = tvrLinks.get(TvrSemantics.SET_SNAPSHOT_MAX);
+    if (tvrs == null) {
+      return ImmutableMap.of();
+    } else {
+      return tvrs.stream()
+          .collect(Collectors.toMap(TvrMetaSet::getTvrType, tvr -> tvr));
+    }
+  }
+
+  public TvrMetaSet getTvrForTvrSet(TvrMetaSetType tvrType) {
+    Set<TvrMetaSet> tvrs = tvrLinks.get(TvrSemantics.SET_SNAPSHOT_MAX);
+    if (tvrs == null) {
+      return null;
+    }
+    return tvrs.stream().filter(tvr -> tvr.getTvrType().equals(tvrType))
+            .findFirst().orElse(null);
+  }
+
+  public boolean makeTvrSetIfPossible(VolcanoPlanner planner,
+      Set<TvrMetaSetType> tvrTypes) {
+    Set<TvrMetaSetType> existing = getAllMaxTvrTypeMap().keySet();
+    tvrTypes.forEach(tvrType -> {
+      if (existing.contains(tvrType)) {
+        return;
+      }
+      TvrMetaSet tvr = new TvrMetaSet(tvrType);
+      addTvrLink(planner, null, TvrSemantics.SET_SNAPSHOT_MAX, tvr);
+      LOGGER.debug("Set {} becomes TvrSet with new tvr {} of type {}", id,
+          tvr.getTvrId(), tvrType);
+    });
+    return true;
+  }
+
+  private void migrateTvrLinksFromOtherSet(VolcanoPlanner planner,
+      RelSet otherSet) {
+    LOGGER.debug("Migrating tvr links in set {} into set {}", otherSet.id, id);
+
+    otherSet.tvrLinks.entries().forEach(entry -> {
+      TvrSemantics tvrKey = entry.getKey();
+      TvrMetaSet otherTvr = entry.getValue();
+      RelSet set = otherTvr.removeTvrLink(tvrKey);
+      if (set == null) {
+        // It is possible that this entry is removed by recursive set/tvr
+        // merge triggered by previous entry iterations.
+        assert !otherSet.tvrLinks.containsEntry(tvrKey, otherTvr);
+        return;
+      }
+      assert
+          set == otherSet :
+          "expecting set " + otherSet.id + " but get set " + set + " from Tvr "
+              + otherTvr.getTvrId();
+
+      equivRoot(this).
+          addTvrLink(planner, null, tvrKey, otherTvr);
+    });
+    // wipe out the stale RelSet other, and ensure tvr link consistency
+    otherSet.tvrLinks.clear();
+  }
+
+  private void updateTvrForMergingSets(RelSet otherSet,
+      VolcanoPlanner planner) {
+    // First merge the tvrs of the same type
+    Map<TvrMetaSetType, TvrMetaSet> myTvrs = getAllMaxTvrTypeMap();
+    Map<TvrMetaSetType, TvrMetaSet> otherTvrs = otherSet.getAllMaxTvrTypeMap();
+    myTvrs.forEach((myType, myTvr) -> {
+      TvrMetaSet otherTvr = otherTvrs.get(myType);
+      if (otherTvr != null && !myTvr.isObsolete() && !otherTvr.isObsolete()) {
+        myTvr.mergeTvr(planner, otherTvr);
+      }
+    });
+    migrateTvrLinksFromOtherSet(planner, otherSet);
+  }
+
+  public boolean addTvrLinkWithSetMerge(VolcanoPlanner planner,
+      TvrSemantics tvrKey, TvrMetaSet tvr) {
+    Set<Pair<RelSet, RelSet>> toFurtherMerge = new LinkedHashSet<>();
+    boolean ret = addTvrLink(planner, toFurtherMerge, tvrKey, tvr);
+
+    for (Pair<RelSet, RelSet> toMerge : toFurtherMerge) {
+      planner.merge(toMerge.left, toMerge.right);
+    }
+    return ret;
+  }
+
+  // Make this method protected so that all tvr rules are forced to use the
+  // transformTo api for adding tvr links.
+  protected boolean addTvrLink(VolcanoPlanner planner,
+      Set<Pair<RelSet, RelSet>> toFurtherMerge, TvrSemantics tvrKey,
+      TvrMetaSet tvr) {
+    // This RelSet should not be obsolete
+    assert this.equivalentSet == null;
+    planner.registerTvrEdgeClass(tvrKey);
+
+    RelSet existingSet = tvr.getRelSet(tvrKey);
+    if (existingSet == null) {
+      LOGGER.debug("Adding tvr link {} from set {} to tvr {}", tvrKey, id,
+          tvr.getTvrId());
+
+      // Make sure the Max tvrs are of distinct tvr types
+      if (tvrKey.equals(TvrSemantics.SET_SNAPSHOT_MAX)) {
+        assert !getAllMaxTvrTypeMap().keySet().contains(tvr.getTvrType());
+      }
+      tvr.addTvrLink(tvrKey, this);
+      tvrLinks.put(tvrKey, tvr);
+      // Check rowType consistency between tvr-linked sets
+      assert RelOptUtil.equal("derived rowType ",
+          tvrKey.deriveRowType(getRowType(), cluster.getTypeFactory()),
+          "actual set snapshot rowType", tvr.getStandardSchema(), Litmus.THROW);
+
+      // Add tvr converters triggered by this new tvr link
+      tvr.addTvrConverters(tvrKey, planner, cluster);
+
+      // Fire rules as a result of this new tvr link
+      planner.fireRules(tvr, tvrKey, this, true);
+
+      return true;
+    }
+    if (this == existingSet) {
+      assert tvrLinks.containsEntry(tvrKey, tvr);
+      return false;
+    }
+    if (toFurtherMerge == null) {
+      throw new RuntimeException(
+          "Not expecting tvr " + tvr.getTvrId() + " to already contains "
+              + tvrKey);
+    }
+    toFurtherMerge.add(new Pair<>(this, existingSet));
+    return true;
+  }
+
+  public int getId() {
+    return id;
   }
 }
 

@@ -19,6 +19,7 @@ package org.apache.calcite.plan.volcano;
 import org.apache.calcite.plan.RelOptRuleOperand;
 import org.apache.calcite.plan.RelTrait;
 import org.apache.calcite.plan.RelTraitSet;
+import org.apache.calcite.plan.tvr.TvrSemantics;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.util.Litmus;
 
@@ -48,8 +49,10 @@ class VolcanoRuleMatch extends VolcanoRuleCall {
    * @param nodeInputs Map from relational expressions to their inputs
    */
   VolcanoRuleMatch(VolcanoPlanner volcanoPlanner, RelOptRuleOperand operand0,
-      RelNode[] rels, Map<RelNode, List<RelNode>> nodeInputs) {
-    super(volcanoPlanner, operand0, rels.clone(), nodeInputs);
+      RelNode[] rels, TvrMetaSet[] tvrs, TvrSemantics[] tvrTraits,
+      TvrProperty[] tvrProperties, Map<RelNode, List<RelNode>> nodeInputs) {
+    super(volcanoPlanner, operand0, rels.clone(), tvrs.clone(),
+        tvrTraits.clone(), tvrProperties.clone(), nodeInputs);
     assert allNotNull(rels, Litmus.THROW);
 
     // Try to deduce which subset the result will belong to. Assume --
@@ -145,6 +148,27 @@ class VolcanoRuleMatch extends VolcanoRuleCall {
         buf.append(", ");
       }
       buf.append(rels[i].toString());
+    }
+    buf.append("] tvrs [");
+    for (int i = 0; i < tvrs.length; i++) {
+      if (i > 0) {
+        buf.append(", ");
+      }
+      buf.append(tvrs[i].toString());
+    }
+    buf.append("] tvrTraits [");
+    for (int i = 0; i < tvrTraits.length; i++) {
+      if (i > 0) {
+        buf.append(", ");
+      }
+      buf.append(tvrTraits[i].toString());
+    }
+    buf.append("] tvrProperties [");
+    for (int i = 0; i < tvrProperties.length; i++) {
+      if (i > 0) {
+        buf.append(", ");
+      }
+      buf.append(tvrProperties[i].toString());
     }
     buf.append("]");
     return buf.toString();

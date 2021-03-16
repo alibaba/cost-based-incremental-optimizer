@@ -20,11 +20,17 @@ import org.apache.calcite.plan.RelOptPlanner;
 import org.apache.calcite.plan.RelOptRuleCall;
 import org.apache.calcite.plan.RelOptRuleOperand;
 import org.apache.calcite.plan.RelOptUtil;
+import org.apache.calcite.plan.tvr.TvrSemantics;
+import org.apache.calcite.plan.volcano.TvrMetaSet;
+import org.apache.calcite.plan.volcano.TvrMetaSetType;
+import org.apache.calcite.plan.volcano.TvrProperty;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.util.Pair;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * HepRuleCall implements {@link RelOptRuleCall} for a {@link HepPlanner}. It
@@ -44,7 +50,8 @@ public class HepRuleCall extends RelOptRuleCall {
       RelNode[] rels,
       Map<RelNode, List<RelNode>> nodeChildren,
       List<RelNode> parents) {
-    super(planner, operand, rels, nodeChildren, parents);
+    super(planner, operand, rels, new TvrMetaSet[0], new TvrSemantics[0],
+        new TvrProperty[0], nodeChildren, parents);
 
     results = new ArrayList<RelNode>();
   }
@@ -52,8 +59,12 @@ public class HepRuleCall extends RelOptRuleCall {
   //~ Methods ----------------------------------------------------------------
 
   // implement RelOptRuleCall
-  public void transformTo(RelNode rel, Map<RelNode, RelNode> equiv) {
+  public void transformToWithOutRootEquivalence(
+      Map<RelNode, Set<TvrMetaSetType>> newRels, Map<RelNode, RelNode> equiv,
+      Map<RelNode, Map<TvrSemantics, List<TvrMetaSet>>> tvrUpdates,
+      Map<Pair<RelNode, TvrMetaSetType>, Map<TvrProperty, List<TvrMetaSet>>> tvrPropertyInLinks) {
     final RelNode rel0 = rels[0];
+    RelNode rel = newRels.keySet().iterator().next();
     RelOptUtil.verifyTypeEquivalence(rel0, rel, rel0);
     results.add(rel);
     rel(0).getCluster().invalidateMetadataQuery();

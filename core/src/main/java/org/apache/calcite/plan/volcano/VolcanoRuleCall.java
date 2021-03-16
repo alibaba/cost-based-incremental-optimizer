@@ -16,32 +16,65 @@
  */
 package org.apache.calcite.plan.volcano;
 
+import com.google.common.collect.ImmutableSet;
 import org.apache.calcite.plan.RelOptListener;
 import org.apache.calcite.plan.RelOptRuleCall;
 import org.apache.calcite.plan.RelOptRuleOperand;
 import org.apache.calcite.plan.RelTraitPropagationVisitor;
 import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.plan.RelOptRuleOperandChildPolicy;
+import org.apache.calcite.plan.tvr.TvrSemantics;
 import org.apache.calcite.rel.RelNode;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
+import org.apache.calcite.util.Pair;
 
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Objects;
 import java.util.Set;
+import java.util.function.BiFunction;
 import java.util.stream.Collectors;
+
+import static org.apache.calcite.plan.volcano.VolcanoPlanner.equivRoot;
 
 /**
  * <code>VolcanoRuleCall</code> implements the {@link RelOptRuleCall} interface
  * for VolcanoPlanner.
  */
 public class VolcanoRuleCall extends RelOptRuleCall {
+
+  /**
+   * Rule match template for a {@link RelOptRuleOperand} in a solve order of a
+   * {@link RelOptRule}. The OperandMatch is compiled once at the time of
+   * assigning solve order, with all possible predicates and pruning
+   * conditions pre-computed as much as possible. The same object is then
+   * re-used (matchRecurse) a lot
+   * of times for rule matching during VolcanoPlanner.
+   */
+  public abstract static class OperandMatch {
+    RelOptRuleOperand operand;
+
+    public OperandMatch(RelOptRuleOperand operand) {
+      this.operand = operand;
+    }
+
+    public int getOperandOrdInRule() {
+      return operand.ordinalInRule;
+    }
+
+    public abstract void matchRecurse(VolcanoRuleCall rc, int solve);
+  }
+
   //~ Instance fields --------------------------------------------------------
 
   protected final VolcanoPlanner volcanoPlanner;
@@ -66,8 +99,11 @@ public class VolcanoRuleCall extends RelOptRuleCall {
       VolcanoPlanner planner,
       RelOptRuleOperand operand,
       RelNode[] rels,
+      TvrMetaSet[] tvrs,
+      TvrSemantics[] tvrTraits,
+      TvrProperty[] tvrProperties,
       Map<RelNode, List<RelNode>> nodeInputs) {
-    super(planner, operand, rels, nodeInputs);
+    super(planner, operand, rels, tvrs, tvrTraits, tvrProperties, nodeInputs);
     this.volcanoPlanner = planner;
   }
 
@@ -83,22 +119,72 @@ public class VolcanoRuleCall extends RelOptRuleCall {
     this(
         planner,
         operand,
-        new RelNode[operand.getRule().operands.size()],
+        new RelNode[operand.getRule().getMatchingRelCount()],
+        new TvrMetaSet[operand.getRule().getMatchingTvrCount()],
+        new TvrSemantics[operand.getRule().getMatchingTvrEdgeCount()],
+        new TvrProperty[operand.getRule().getMatchingTvrPropertyEdgeCount()],
         ImmutableMap.of());
   }
 
   //~ Methods ----------------------------------------------------------------
 
   // implement RelOptRuleCall
-  public void transformTo(RelNode rel, Map<RelNode, RelNode> equiv) {
+  public void transformToWithOutRootEquivalence(
+      Map<RelNode, Set<TvrMetaSetType>> newRels, Map<RelNode, RelNode> equiv,
+      Map<RelNode, Map<TvrSemantics, List<TvrMetaSet>>> tvrUpdates,
+      Map<Pair<RelNode, TvrMetaSetType>, Map<TvrProperty, List<TvrMetaSet>>> tvrPropertyInLinks) {
     if (LOGGER.isDebugEnabled()) {
-      LOGGER.debug("Transform to: rel#{} via {}{}", rel.getId(), getRule(),
-          equiv.isEmpty() ? "" : " with equivalences " + equiv);
+      LOGGER.debug("TransformToWithoutRootEquiv: rels#{} via {} with "
+          + "tvrUpdates {}, and "
+          + "equivalences {}", newRels, getRule(), tvrUpdates, equiv);
       if (generatedRelList != null) {
-        generatedRelList.add(rel);
+        generatedRelList.addAll(newRels.keySet());
       }
     }
+
+    // Let's see whether this is the a rule match that operates entirely on
+    // certain types of TvrSets, if so the generated rel will also be marked
+    // as TvrSets of the types.
+    // TODO: after group apply or other ANY (e.g. deltaAny) added, also need
+    //  to make sure that all matched RelNodes here have identity time
+    //  function
+    Set<TvrMetaSetType> inferredTvrTypes = null;
+    if ((tvrs.length == 0 && newRels.values().stream().allMatch(Set::isEmpty)
+        && tvrUpdates.size() == 0 && tvrPropertyInLinks.size() == 0)) {
+      for (RelNode matchedRel : rels) {
+        if (matchedRel instanceof RelSubset) {
+          // Subset doesn't have tvrGenericRels entry
+          continue;
+        }
+        Set<TvrMetaSetType> types =
+            volcanoPlanner.getGenericRelTvrTypes(matchedRel);
+        // Consistency check
+        assert volcanoPlanner.getSet(matchedRel).getAllMaxTvrTypeMap().keySet()
+            .containsAll(types);
+
+        if (inferredTvrTypes == null) {
+          inferredTvrTypes = new LinkedHashSet<>(types);
+        } else {
+          inferredTvrTypes.retainAll(types);
+        }
+
+        if (inferredTvrTypes.isEmpty()) {
+          break;
+        }
+      }
+    }
+    if (inferredTvrTypes == null) {
+      inferredTvrTypes = ImmutableSet.of();
+    }
+    if (!inferredTvrTypes.isEmpty()) {
+      LOGGER.debug("New rels will be marked as generic in tvrSet with types {}",
+          inferredTvrTypes);
+    }
+
     try {
+      // TODO: fix this properly
+      RelNode rel = newRels.keySet().iterator().next();
+
       // It's possible that rel is a subset or is already registered.
       // Is there still a point in continuing? Yes, because we might
       // discover that two sets of expressions are actually equivalent.
@@ -129,14 +215,35 @@ public class VolcanoRuleCall extends RelOptRuleCall {
         volcanoPlanner.listener.ruleProductionSucceeded(event);
       }
 
-      // Registering the root relational expression implicitly registers
-      // its descendants. Register any explicit equivalences first, so we
-      // don't register twice and cause churn.
-      for (Map.Entry<RelNode, RelNode> entry : equiv.entrySet()) {
-        volcanoPlanner.ensureRegistered(
-            entry.getKey(), entry.getValue(), this);
+      // Register all new RelNodes properly
+      for (Entry<RelNode, Set<TvrMetaSetType>> entry : newRels.entrySet()) {
+        Set<TvrMetaSetType> newTvrTypes = entry.getValue();
+        if (newTvrTypes.isEmpty()) {
+          newTvrTypes = inferredTvrTypes;
+        }
+        volcanoPlanner.registerAsTvrGeneric(entry.getKey(), newTvrTypes, equiv);
       }
-      volcanoPlanner.ensureRegistered(rel, rels[0], this);
+
+      // Update tvr info
+      tvrUpdates.forEach((node, updateMap) -> {
+        RelNode relNode = volcanoPlanner.ensureRegistered(node, null);
+        RelSet relSet = volcanoPlanner.getSet(relNode);
+        updateMap.forEach((tvrKey, tvrs) -> {
+          tvrs.forEach(tvr -> equivRoot(relSet)
+              .addTvrLinkWithSetMerge(volcanoPlanner, tvrKey, tvr));
+        });
+      });
+
+      // Update tvr property edges
+      tvrPropertyInLinks.forEach((pair, propertyInLinks) -> {
+        RelNode relNode = volcanoPlanner.ensureRegistered(pair.left, null);
+        TvrMetaSet toTvr =
+            volcanoPlanner.getSet(relNode).getTvrForTvrSet(pair.right);
+        assert toTvr != null;
+        propertyInLinks.forEach((tvrProperty, fromTvrs) -> fromTvrs.forEach(
+            fromTvr -> fromTvr
+                .addPropertyEdge(volcanoPlanner, tvrProperty, toTvr)));
+      });
 
       if (volcanoPlanner.listener != null) {
         RelOptListener.RuleProductionEvent event =
@@ -192,6 +299,14 @@ public class VolcanoRuleCall extends RelOptRuleCall {
         }
       }
 
+      for (TvrMetaSet tvr : tvrs) {
+        if (tvr.isObsolete()) {
+          LOGGER.debug("Rule [{}] not fired because tvr#{} is obsolete",
+              getRule(), tvr.getTvrId());
+          return;
+        }
+      }
+
       if (LOGGER.isDebugEnabled()) {
         LOGGER.debug(
             "call#{}: Apply rule [{}] to {}",
@@ -240,15 +355,64 @@ public class VolcanoRuleCall extends RelOptRuleCall {
     }
   }
 
-  /**
-   * Applies this rule, with a given relational expression in the first slot.
-   */
+  private static int getRelIndex(RelOptRuleOperand op) {
+    int ord = op.ordinalInRule;
+    int start = op.getRule().getRelOpStartIndex();
+    int count = op.getRule().getMatchingRelCount();
+    assert start <= ord && ord < start + count;
+    return ord - start;
+  }
+
+  private static int getTvrIndex(RelOptRuleOperand op) {
+    assert op instanceof TvrRelOptRuleOperand;
+    int ord = op.ordinalInRule;
+    int start = op.getRule().getTvrOpStartIndex();
+    int count = op.getRule().getMatchingTvrCount();
+    assert start <= ord && ord < start + count;
+    return ord - start;
+  }
+
+  private static int getTvrEdgeIndex(RelOptRuleOperand op) {
+    assert op instanceof TvrEdgeRelOptRuleOperand;
+    int ord = op.ordinalInRule;
+    int start = op.getRule().getTvrEdgeOpStartIndex();
+    int count = op.getRule().getMatchingTvrEdgeCount();
+    assert start <= ord && ord < start + count;
+    return ord - start;
+  }
+
+  private static int getTvrPropertyEdgeIndex(RelOptRuleOperand op) {
+    assert op instanceof TvrPropertyEdgeRuleOperand;
+    int ord = op.ordinalInRule;
+    int start = op.getRule().getTvrPropertyEdgeOpStartIndex();
+    int count = op.getRule().getMatchingTvrPropertyEdgeCount();
+    assert start <= ord && ord < start + count;
+    return ord - start;
+  }
+
   void match(RelNode rel) {
-    assert getOperand0().matches(rel) : "precondition";
-    final int solve = 0;
-    int operandOrdinal = getOperand0().solveOrder[solve];
-    this.rels[operandOrdinal] = rel;
-    matchRecurse(solve + 1);
+    OperandMatch opMatch = operand0.solveOrder.get(0);
+    assert opMatch instanceof MatchInitialRel;
+    ((MatchInitialRel) opMatch).matchRecurse(this, rel);
+  }
+
+  void match(TvrMetaSet tvr) {
+    OperandMatch opMatch = operand0.solveOrder.get(0);
+    assert opMatch instanceof MatchInitialTvr;
+    ((MatchInitialTvr) opMatch).matchRecurse(this, tvr);
+  }
+
+  void match(TvrMetaSet tvr, TvrSemantics tvrKey, RelSet set) {
+    OperandMatch opMatch = operand0.solveOrder.get(0);
+    assert opMatch instanceof MatchInitialTvrEdge;
+    ((MatchInitialTvrEdge) opMatch).matchRecurse(this, tvr, tvrKey, set);
+  }
+
+  void match(TvrMetaSet fromTvr, TvrMetaSet toTvr, TvrProperty tvrProperty) {
+    OperandMatch opMatch = operand0.solveOrder.get(0);
+    assert opMatch instanceof MatchInitialTvrPropertyEdge;
+    ((MatchInitialTvrPropertyEdge) opMatch)
+        .matchRecurse(this, fromTvr, toTvr, tvrProperty);
   }
 
   /**
@@ -260,8 +424,13 @@ public class VolcanoRuleCall extends RelOptRuleCall {
     assert solve > 0;
     assert solve <= rule.operands.size();
     final List<RelOptRuleOperand> operands = getRule().operands;
-
     if (solve == operands.size()) {
+      // Consistency checks
+      assert Arrays.stream(rels).noneMatch(Objects::isNull);
+      assert Arrays.stream(tvrs).noneMatch(Objects::isNull);
+      assert Arrays.stream(tvrTraits).noneMatch(Objects::isNull);
+      assert Arrays.stream(tvrProperties).noneMatch(Objects::isNull);
+
       // We have matched all operands. Now ask the rule whether it
       // matches; this gives the rule chance to apply side-conditions.
       // If the side-conditions are satisfied, we have a match.
@@ -271,94 +440,826 @@ public class VolcanoRuleCall extends RelOptRuleCall {
       return;
     }
 
-    final int operandOrdinal = operand0.solveOrder[solve];
-    final int previousOperandOrdinal = operand0.solveOrder[solve - 1];
-    boolean ascending = operandOrdinal < previousOperandOrdinal;
-    final RelOptRuleOperand previousOperand =
-        operands.get(previousOperandOrdinal);
-    final RelOptRuleOperand operand = operands.get(operandOrdinal);
-    final RelNode previous = rels[previousOperandOrdinal];
+    OperandMatch opMatch = operand0.solveOrder.get(solve);
+    opMatch.matchRecurse(this, solve);
+  }
 
-    final RelOptRuleOperand parentOperand;
-    final Collection<? extends RelNode> successors;
-    if (ascending) {
-      assert previousOperand.getParent() == operand;
-      parentOperand = operand;
-      final RelSubset subset = volcanoPlanner.getSubset(previous);
-      successors = subset.getParentRels();
-    } else {
-      parentOperand = operand.getParent();
-      final int parentOrdinal = operand.getParent().ordinalInRule;
-      final RelNode parentRel = rels[parentOrdinal];
-      final List<RelNode> inputs = parentRel.getInputs();
-      // if the child is unordered, then add all rels in all input subsets to the successors list
-      // because unordered can match child in any ordinal
-      if (parentOperand.childPolicy == RelOptRuleOperandChildPolicy.UNORDERED) {
-        if (operand.getMatchedClass() == RelSubset.class) {
-          successors = inputs;
-        } else {
-          successors = inputs.stream().distinct()
-              .flatMap(input -> ((RelSubset) input).getRelList().stream())
-              .distinct().collect(Collectors.toList());
+  /**
+   * Match code for the first operand matching a relNode.
+   */
+  public static class MatchInitialRel extends OperandMatch {
+    RelOpMatchInfo relOpMatchInfo;
+    int relIndex;
+
+    public MatchInitialRel(RelOptRuleOperand operand, Set<Integer> assigned) {
+      super(operand);
+      relOpMatchInfo = new RelOpMatchInfo(operand, assigned);
+      relIndex = getRelIndex(operand);
+    }
+
+    @Override
+    public void matchRecurse(VolcanoRuleCall rc, int solve) {
+      throw new RuntimeException("should not be here for solve order " + solve);
+    }
+
+    public void matchRecurse(VolcanoRuleCall rc, RelNode rel) {
+      RelOpMatchInfoRuntime runtimeInfo = relOpMatchInfo.compileRuntime(rc);
+      if (runtimeInfo == null || !runtimeInfo.matches(rel, rc.volcanoPlanner)) {
+        return;
+      }
+      rc.rels[relIndex] = rel;
+      rc.matchRecurse(1);
+      rc.rels[relIndex] = null;
+    }
+  }
+
+  /**
+   * Match code for the first operand matching a TvrMetaSet.
+   */
+  public static class MatchInitialTvr extends OperandMatch {
+    TvrOpMatchInfo tvrOpMatchInfo;
+    int tvrIndex;
+
+    public MatchInitialTvr(TvrRelOptRuleOperand tvrOp, Set<Integer> assigned) {
+      super(tvrOp);
+      tvrOpMatchInfo = new TvrOpMatchInfo(tvrOp, assigned);
+      tvrIndex = getTvrIndex(tvrOp);
+    }
+
+    @Override
+    public void matchRecurse(VolcanoRuleCall rc, int solve) {
+      throw new RuntimeException("should not be here for solve order " + solve);
+    }
+
+    public void matchRecurse(VolcanoRuleCall rc, TvrMetaSet tvr) {
+      TvrOpMatchInfoRuntime runtimeInfo = tvrOpMatchInfo.compileRuntime(rc);
+      if (runtimeInfo == null || !runtimeInfo.matches(tvr)) {
+        return;
+      }
+      rc.tvrs[tvrIndex] = tvr;
+      rc.matchRecurse(1);
+      rc.tvrs[tvrIndex] = null;
+    }
+  }
+
+  /**
+   * Match code for the first operand matching a TvrEdge.
+   */
+  public static class MatchInitialTvrEdge extends OperandMatch {
+    TvrEdgeOpMatchInfo tvrEdgeOpMatchInfo;
+    int edgeIndex, tvrIndex;
+
+    public MatchInitialTvrEdge(TvrEdgeRelOptRuleOperand edgeOp,
+        Set<Integer> assigned) {
+      super(edgeOp);
+      tvrEdgeOpMatchInfo = new TvrEdgeOpMatchInfo(edgeOp, assigned);
+      edgeIndex = getTvrEdgeIndex(edgeOp);
+      tvrIndex = getTvrIndex(edgeOp.tvrOp);
+    }
+
+    @Override
+    public void matchRecurse(VolcanoRuleCall rc, int solve) {
+      throw new RuntimeException("should not be here for solve order " + solve);
+    }
+
+    public void matchRecurse(VolcanoRuleCall rc, TvrMetaSet tvr,
+        TvrSemantics tvrKey, RelSet set) {
+      TvrEdgeOpMatchInfoRuntime runtimeInfo =
+          tvrEdgeOpMatchInfo.compileRuntime(rc);
+      if (!runtimeInfo.matches(tvrKey, rc)) {
+        return;
+      }
+      rc.tvrTraits[edgeIndex] = tvrKey;
+      rc.tvrs[tvrIndex] = tvr;
+      rc.matchRecurse(1);
+      rc.tvrs[tvrIndex] = null;
+      rc.tvrTraits[edgeIndex] = null;
+    }
+  }
+
+  /**
+   * Match code for the first operand matching a TvrPropertyEdge.
+   */
+  public static class MatchInitialTvrPropertyEdge extends OperandMatch {
+    TvrPropertyEdgeOpMatchInfo propertyEdgeMatchInfo;
+    int fromTvrIndex, toTvrIndex, edgeIndex;
+
+    public MatchInitialTvrPropertyEdge(TvrPropertyEdgeRuleOperand propertyOp) {
+      super(propertyOp);
+      propertyEdgeMatchInfo = new TvrPropertyEdgeOpMatchInfo(propertyOp);
+      fromTvrIndex = getTvrIndex(propertyOp.fromTvrOp);
+      toTvrIndex = getTvrIndex(propertyOp.toTvrOp);
+      edgeIndex = getTvrPropertyEdgeIndex(propertyOp);
+    }
+
+    @Override
+    public void matchRecurse(VolcanoRuleCall rc, int solve) {
+      throw new RuntimeException("should not be here for solve order " + solve);
+    }
+
+    public void matchRecurse(VolcanoRuleCall rc, TvrMetaSet fromTvr,
+        TvrMetaSet toTvr, TvrProperty tvrProperty) {
+      if (!propertyEdgeMatchInfo.matches(tvrProperty)) {
+        return;
+      }
+      rc.tvrProperties[edgeIndex] = tvrProperty;
+      rc.tvrs[fromTvrIndex] = fromTvr;
+      rc.tvrs[toTvrIndex] = toTvr;
+      rc.matchRecurse(1);
+      rc.tvrs[toTvrIndex] = null;
+      rc.tvrs[fromTvrIndex] = null;
+      rc.tvrProperties[edgeIndex] = null;
+    }
+  }
+
+  /**
+   * Match code for a TvrRelOptRuleOperand. One assumption is that the first
+   * matched edge that connects to this tvrOp should have matched a tvr for me.
+   */
+  public static class MatchTvr extends OperandMatch {
+    TvrOpMatchInfo tvrOpMatchInfo;
+
+    public MatchTvr(TvrRelOptRuleOperand tvrOp, Set<Integer> assigned) {
+      super(tvrOp);
+      this.tvrOpMatchInfo = new TvrOpMatchInfo(tvrOp, assigned);
+    }
+
+    @Override
+    public void matchRecurse(VolcanoRuleCall rc, int solve) {
+      TvrMetaSet tvr = rc.tvrs[getTvrIndex(operand)];
+      // Assumption: the first matched edge that connects to this tvrOp
+      // should have matched a tvr for me
+      assert tvr != null;
+
+      TvrOpMatchInfoRuntime runtimeInfo = tvrOpMatchInfo.compileRuntime(rc);
+      if (runtimeInfo == null || !runtimeInfo.matches(tvr)) {
+        return;
+      }
+      rc.matchRecurse(solve + 1);
+    }
+  }
+
+  /**
+   * Match code for a TvrEdgeRelOptRuleOperand whose end TvrOp is already
+   * matched but the other end RelOp is not.
+   */
+  public static class MatchTvrEdgeTvr2Rel extends OperandMatch {
+    TvrEdgeOpMatchInfo tvrEdgeOpMatchInfo;
+    int edgeIndex, tvrIndex;
+
+    public MatchTvrEdgeTvr2Rel(TvrEdgeRelOptRuleOperand edgeOp,
+        Set<Integer> assigned) {
+      super(edgeOp);
+      tvrEdgeOpMatchInfo = new TvrEdgeOpMatchInfo(edgeOp, assigned);
+      edgeIndex = getTvrEdgeIndex(edgeOp);
+      tvrIndex = getTvrIndex(edgeOp.tvrOp);
+    }
+
+    @Override
+    public void matchRecurse(VolcanoRuleCall rc, int solve) {
+      TvrEdgeOpMatchInfoRuntime runtimeInfo =
+          tvrEdgeOpMatchInfo.compileRuntime(rc);
+      rc.tvrs[tvrIndex].tvrSets.forEach((tvrKey, set) -> {
+        if (runtimeInfo.matches(tvrKey, rc)) {
+          rc.tvrTraits[edgeIndex] = tvrKey;
+          rc.matchRecurse(solve + 1);
+          rc.tvrTraits[edgeIndex] = null;
         }
-      } else if (operand.ordinalInParent < inputs.size()) {
-        // child policy is not unordered
-        // we need to find the exact input node based on child operand's ordinalInParent
-        final RelSubset subset =
-            (RelSubset) inputs.get(operand.ordinalInParent);
-        if (operand.getMatchedClass() == RelSubset.class) {
-          // If the rule wants the whole subset, we just provide it
-          successors = ImmutableList.of(subset);
-        } else {
-          successors = subset.getRelList();
+      });
+    }
+  }
+
+  /**
+   * Match code for a TvrEdgeRelOptRuleOperand whose end RelOp is already
+   * matched but the other end TvrOp is not.
+   */
+  public static class MatchTvrEdgeRel2Tvr extends OperandMatch {
+    TvrEdgeOpMatchInfo tvrEdgeOpMatchInfo;
+    int edgeIndex, tvrIndex, relIndex;
+
+    public MatchTvrEdgeRel2Tvr(TvrEdgeRelOptRuleOperand edgeOp,
+        Set<Integer> assigned) {
+      super(edgeOp);
+      tvrEdgeOpMatchInfo = new TvrEdgeOpMatchInfo(edgeOp, assigned);
+      edgeIndex = getTvrEdgeIndex(edgeOp);
+      tvrIndex = getTvrIndex(edgeOp.tvrOp);
+      relIndex = getRelIndex(edgeOp.relOp);
+    }
+
+    @Override
+    public void matchRecurse(VolcanoRuleCall rc, int solve) {
+      TvrEdgeOpMatchInfoRuntime runtimeInfo =
+          tvrEdgeOpMatchInfo.compileRuntime(rc);
+      rc.volcanoPlanner.getSet(rc.rels[relIndex]).tvrLinks.asMap()
+          .forEach((tvrKey, tvrList) -> {
+            if (!runtimeInfo.matches(tvrKey, rc)) {
+              return;
+            }
+            rc.tvrTraits[edgeIndex] = tvrKey;
+            tvrList.forEach(tvr -> {
+              rc.tvrs[tvrIndex] = tvr;
+              rc.matchRecurse(solve + 1);
+              rc.tvrs[tvrIndex] = null;
+            });
+            rc.tvrTraits[edgeIndex] = null;
+          });
+    }
+  }
+
+  /**
+   * Match code for a TvrEdgeRelOptRuleOperand whose both ends (RelOp and TvrOp)
+   * are already matched.
+   */
+  public static class MatchTvrEdgeOnly extends OperandMatch {
+    TvrEdgeOpMatchInfo tvrEdgeOpMatchInfo;
+    int edgeIndex, tvrIndex, relIndex;
+
+    public MatchTvrEdgeOnly(TvrEdgeRelOptRuleOperand edgeOp,
+        Set<Integer> assigned) {
+      super(edgeOp);
+      tvrEdgeOpMatchInfo = new TvrEdgeOpMatchInfo(edgeOp, assigned);
+      edgeIndex = getTvrEdgeIndex(edgeOp);
+      tvrIndex = getTvrIndex(edgeOp.tvrOp);
+      relIndex = getRelIndex(edgeOp.relOp);
+    }
+
+    @Override
+    public void matchRecurse(VolcanoRuleCall rc, int solve) {
+      TvrEdgeOpMatchInfoRuntime runtimeInfo =
+          tvrEdgeOpMatchInfo.compileRuntime(rc);
+      RelSet relSet = rc.volcanoPlanner.getSet(rc.rels[relIndex]);
+      assert relSet != null;
+      rc.tvrs[tvrIndex].tvrSets.forEach((tvrKey, set) -> {
+        if (set == relSet && runtimeInfo.matches(tvrKey, rc)) {
+          rc.tvrTraits[edgeIndex] = tvrKey;
+          rc.matchRecurse(solve + 1);
+          rc.tvrTraits[edgeIndex] = null;
         }
+      });
+    }
+  }
+
+  /**
+   * Match code for a TvrPropertyEdgeRuleOperand whose fromTvrOp is already
+   * matched but the toTvrOp is not.
+   */
+  public static class MatchPropertyEdgeFrom2To extends OperandMatch {
+    TvrPropertyEdgeOpMatchInfo propertyEdgeMatchInfo;
+    int fromTvrIndex, toTvrIndex, edgeIndex;
+
+    public MatchPropertyEdgeFrom2To(TvrPropertyEdgeRuleOperand propertyOp) {
+      super(propertyOp);
+      propertyEdgeMatchInfo = new TvrPropertyEdgeOpMatchInfo(propertyOp);
+      fromTvrIndex = getTvrIndex(propertyOp.fromTvrOp);
+      toTvrIndex = getTvrIndex(propertyOp.toTvrOp);
+      edgeIndex = getTvrPropertyEdgeIndex(propertyOp);
+    }
+
+    @Override
+    public void matchRecurse(VolcanoRuleCall rc, int solve) {
+      rc.tvrs[fromTvrIndex].tvrPropertyLinks.forEach((tvrProperty, tvr) -> {
+        if (propertyEdgeMatchInfo.matches(tvrProperty)) {
+          rc.tvrProperties[edgeIndex] = tvrProperty;
+          rc.tvrs[toTvrIndex] = tvr;
+          rc.matchRecurse(solve + 1);
+          rc.tvrs[toTvrIndex] = null;
+          rc.tvrProperties[edgeIndex] = null;
+        }
+      });
+    }
+  }
+
+  /**
+   * Match code for a TvrPropertyEdgeRuleOperand whose toTvrOp is already
+   * matched but the fromTvrOp is not.
+   */
+  public static class MatchPropertyEdgeTo2From extends OperandMatch {
+    TvrPropertyEdgeOpMatchInfo propertyEdgeMatchInfo;
+    int fromTvrIndex, toTvrIndex, edgeIndex;
+
+    public MatchPropertyEdgeTo2From(TvrPropertyEdgeRuleOperand propertyOp) {
+      super(propertyOp);
+      propertyEdgeMatchInfo = new TvrPropertyEdgeOpMatchInfo(propertyOp);
+      fromTvrIndex = getTvrIndex(propertyOp.fromTvrOp);
+      toTvrIndex = getTvrIndex(propertyOp.toTvrOp);
+      edgeIndex = getTvrPropertyEdgeIndex(propertyOp);
+    }
+
+    @Override
+    public void matchRecurse(VolcanoRuleCall rc, int solve) {
+      rc.tvrs[toTvrIndex].reverseTvrPropertyLinks.asMap()
+          .forEach((tvrProperty, tvrs) -> {
+            if (!propertyEdgeMatchInfo.matches(tvrProperty)) {
+              return;
+            }
+            rc.tvrProperties[edgeIndex] = tvrProperty;
+            tvrs.forEach(tvr -> {
+              rc.tvrs[fromTvrIndex] = tvr;
+              rc.matchRecurse(solve + 1);
+              rc.tvrs[fromTvrIndex] = null;
+            });
+            rc.tvrProperties[edgeIndex] = null;
+          });
+    }
+  }
+
+  /**
+   * Match code for a TvrPropertyEdgeRuleOperand whose both ends fromTvrOp and
+   * toTvrOp are already matched.
+   */
+  public static class MatchPropertyEdgeOnly extends OperandMatch {
+    TvrPropertyEdgeOpMatchInfo propertyEdgeMatchInfo;
+    int fromTvrIndex, toTvrIndex, edgeIndex;
+
+    public MatchPropertyEdgeOnly(TvrPropertyEdgeRuleOperand propertyOp) {
+      super(propertyOp);
+      propertyEdgeMatchInfo = new TvrPropertyEdgeOpMatchInfo(propertyOp);
+      fromTvrIndex = getTvrIndex(propertyOp.fromTvrOp);
+      toTvrIndex = getTvrIndex(propertyOp.toTvrOp);
+      edgeIndex = getTvrPropertyEdgeIndex(propertyOp);
+    }
+
+    @Override
+    public void matchRecurse(VolcanoRuleCall rc, int solve) {
+      TvrMetaSet toTvr = rc.tvrs[toTvrIndex];
+      assert toTvr != null;
+      rc.tvrs[fromTvrIndex].tvrPropertyLinks.forEach((tvrProperty, tvr) -> {
+        if (propertyEdgeMatchInfo.matches(tvrProperty) && tvr == toTvr) {
+          rc.tvrProperties[edgeIndex] = tvrProperty;
+          rc.matchRecurse(solve + 1);
+          rc.tvrProperties[edgeIndex] = null;
+        }
+      });
+    }
+  }
+
+  /**
+   * This is the first relOperand in an operand tree.
+   */
+  public static class MatchFirstRelInTree extends OperandMatch {
+    RelOpMatchInfo relOpMatchInfo;
+    int relIndex;
+
+    public MatchFirstRelInTree(RelOptRuleOperand operand,
+        Set<Integer> assigned) {
+      super(operand);
+      relOpMatchInfo = new RelOpMatchInfo(operand, assigned);
+      relIndex = getRelIndex(operand);
+    }
+
+    @Override
+    public void matchRecurse(VolcanoRuleCall rc, int solve) {
+      RelOpMatchInfoRuntime runtimeInfo = relOpMatchInfo.compileRuntime(rc);
+      if (runtimeInfo == null) {
+        return;
+      }
+      RelSet set = runtimeInfo.set;
+      assert set != null;
+      // Look for the rel node match within the relSet
+      List<? extends RelNode> candidates;
+      if (operand.getMatchedClass() == RelSubset.class) {
+        // All subSets in this RelSet are candidates.
+        candidates = set.subsets;
       } else {
-        // The operand expects parentRel to have a certain number
-        // of inputs and it does not.
-        successors = ImmutableList.of();
+        // All relNodes in this RelSet are candidates.
+        candidates = set.getRelsFromAllSubsets();
+      }
+      for (RelNode rel : candidates) {
+        if (!runtimeInfo.matches(rel, rc.volcanoPlanner)) {
+          continue;
+        }
+        rc.rels[relIndex] = rel;
+        rc.matchRecurse(solve + 1);
+        rc.rels[relIndex] = null;
+      }
+    }
+  }
+
+  /**
+   * Both current and previous operands are RelNode operands. They must be
+   * from the same operand tree.
+   */
+  public static class MatchNonFirstRel extends OperandMatch {
+    RelOpMatchInfo relOpMatchInfo;
+    int relIndex;
+
+    public MatchNonFirstRel(RelOptRuleOperand operand, Set<Integer> assigned) {
+      super(operand);
+      relOpMatchInfo = new RelOpMatchInfo(operand, assigned);
+      relIndex = getRelIndex(operand);
+    }
+
+    @Override
+    public void matchRecurse(VolcanoRuleCall rc, int solve) {
+      OperandMatch previousOp = rc.operand0.solveOrder.get(solve - 1);
+      final int operandOrdinal = getOperandOrdInRule();
+      final int previousOperandOrdinal = previousOp.getOperandOrdInRule();
+
+      RelOpMatchInfoRuntime runtimeInfo = relOpMatchInfo.compileRuntime(rc);
+      if (runtimeInfo == null) {
+        return;
+      }
+
+      boolean ascending = operandOrdinal < previousOperandOrdinal;
+      final RelOptRuleOperand previousOperand = previousOp.operand;
+      final RelNode previous = rc.rels[getRelIndex(previousOperand)];
+
+      final RelOptRuleOperand parentOperand;
+      final Collection<? extends RelNode> successors;
+      if (ascending) {
+        assert previousOperand.getParent() == operand;
+        assert operand.getMatchedClass() != RelSubset.class;
+        parentOperand = operand;
+        final RelSubset subset = rc.volcanoPlanner.getSubset(previous);
+        successors = subset.getParentRels();
+      } else {
+        parentOperand = operand.getParent();
+        final RelNode parentRel = rc.rels[getRelIndex(parentOperand)];
+        final List<RelNode> inputs = parentRel.getInputs();
+        // if the child is unordered, then add all rels in all input subsets to
+        // the successors list
+        // because unordered can match child in any ordinal
+        if (parentOperand.childPolicy == RelOptRuleOperandChildPolicy.UNORDERED) {
+          if (operand.getMatchedClass() == RelSubset.class) {
+            // Find all the sibling subsets that satisfy this subset'straitSet
+            successors = inputs.stream().flatMap(subset -> ((RelSubset) subset).getSubsetsSatisfingThis())
+                .collect(Collectors.toList());
+          } else {
+            successors = inputs.stream().distinct()
+                .flatMap(input -> ((RelSubset) input).getRelList().stream()).distinct().collect(Collectors.toList());
+          }
+        } else if (operand.ordinalInParent < inputs.size()) {
+          // child policy is not unordered
+          // we need to find the exact input node based on child operand's ordinalInParent
+          final RelSubset subset = (RelSubset) inputs.get(operand.ordinalInParent);
+          if (operand.getMatchedClass() == RelSubset.class) {
+            // Find all the sibling subsets that satisfy this subset'straitSet
+            successors = subset.getSubsetsSatisfingThis().collect(Collectors.toList());
+          } else {
+            successors = subset.getRelList();
+          }
+        } else {
+          // The operand expects parentRel to have a certain number
+          // of inputs and it does not.
+          successors = ImmutableList.of();
+        }
+      }
+
+      for (RelNode rel : successors) {
+        if (parentOperand.childPolicy == RelOptRuleOperandChildPolicy.UNORDERED) {
+          // Assign "childRels" if the operand is UNORDERED.
+          // Remarks:
+          // getChildRels is only valid for the case of
+          // RelOptRuleOperandChildPolicy.UNORDERED (See the comments of
+          // getChildRels).
+          // For each child in the returned child relNodes:
+          // - If it is matched in the rule, it is set to the matched RelNode
+          // (not RelSubset);
+          // - Otherwise, it is set to the corresponding RelSubset
+          if (ascending) {
+            final List<RelNode> inputs = Lists.newArrayList(rel.getInputs());
+            inputs.set(previousOperand.ordinalInParent, previous);
+            rc.setChildRels(rel, inputs);
+          } else {
+            List<RelNode> inputs = rc.getChildRels(previous);
+            if (inputs == null) {
+              inputs = Lists.newArrayList(previous.getInputs());
+            }
+            inputs.set(operand.ordinalInParent, rel);
+            rc.setChildRels(previous, inputs);
+          }
+        } else if (ascending) {
+          // We know that the previous operand was *a* child of its parent,
+          // but now check that it is the *correct* child.
+          if (rel.getInputs().size() <= previousOperand.ordinalInParent) {
+            continue;
+          }
+          final RelSubset input = (RelSubset) rel.getInput(previousOperand.ordinalInParent);
+          if (previousOperand.getMatchedClass() == RelSubset.class) {
+            if (input.getSubsetsSatisfingThis().noneMatch(previous::equals)) {
+              continue;
+            }
+          } else {
+            List<RelNode> inputRels = input.getRelList();
+            if (!inputRels.contains(previous)) {
+              continue;
+            }
+          }
+        }
+
+        if (!runtimeInfo.matches(rel, rc.volcanoPlanner)) {
+          continue;
+        }
+
+        rc.rels[relIndex] = rel;
+        rc.matchRecurse(solve + 1);
+        rc.rels[relIndex] = null;
+      }
+    }
+  }
+
+  /**
+   * Match conditions for a TvrPropertyEdge. Computed once at compile (assign)
+   * time.
+   */
+  private static class TvrPropertyEdgeOpMatchInfo {
+    TvrPropertyEdgeRuleOperand propertyOp;
+
+    TvrPropertyEdgeOpMatchInfo(TvrPropertyEdgeRuleOperand propertyOp) {
+      this.propertyOp = propertyOp;
+    }
+
+    boolean matches(TvrProperty property) {
+      return propertyOp.matches(property);
+    }
+  }
+
+  /**
+   * Match conditions for a TvrEdge. Computed once at compile (assign) time.
+   */
+  private static class TvrEdgeOpMatchInfo {
+    TvrEdgeRelOptRuleOperand edgeOp;
+    List<BiFunction<VolcanoRuleCall, TvrSemantics, Boolean>> timePreds;
+
+    // Used to avoid two edgeOps of a TvrOp matching the same tvr edge
+    Set<Integer> tvrEdgeIndices;
+
+    TvrEdgeOpMatchInfo(TvrEdgeRelOptRuleOperand edgeOp, Set<Integer> assigned) {
+      this.edgeOp = edgeOp;
+
+      this.tvrEdgeIndices = edgeOp.tvrOp.tvrChildren.stream()
+          .filter(edge -> assigned.contains(edge.ordinalInRule))
+          .map(VolcanoRuleCall::getTvrEdgeIndex).collect(Collectors.toSet());
+
+      this.timePreds = new ArrayList<>();
+      edgeOp.getRule().identicalTimeEdges.forEach(edges -> {
+        if (edges.contains(edgeOp)) {
+          for (TvrEdgeRelOptRuleOperand edge : edges) {
+            if (assigned.contains(edge.ordinalInRule) && edge != edgeOp) {
+              int edgeIndex = getTvrEdgeIndex(edge);
+              timePreds.add((rc, tvrKey) ->
+                  tvrKey.fromVersion == rc.tvrTraits[edgeIndex].fromVersion
+                      && tvrKey.toVersion == rc.tvrTraits[edgeIndex].toVersion);
+              break;
+            }
+          }
+        }
+      });
+
+      edgeOp.getRule().adjacentTimeEdges.forEach(edges -> {
+        int index = edges.indexOf(edgeOp);
+        if (index == -1) {
+          return;
+        }
+        if (index > 0) {
+          TvrEdgeRelOptRuleOperand prev = edges.get(index - 1);
+          if (assigned.contains(prev.ordinalInRule)) {
+            int edgeIndex = getTvrEdgeIndex(prev);
+            timePreds.add((rc, tvrKey) -> tvrKey.fromVersion
+                == rc.tvrTraits[edgeIndex].toVersion);
+          }
+        }
+        if (index + 1 < edges.size()) {
+          TvrEdgeRelOptRuleOperand next = edges.get(index + 1);
+          if (assigned.contains(next.ordinalInRule)) {
+            int edgeIndex = getTvrEdgeIndex(next);
+            timePreds.add((rc, tvrKey) -> tvrKey.toVersion
+                == rc.tvrTraits[edgeIndex].fromVersion);
+          }
+        }
+      });
+    }
+
+    /**
+     * Compute matchInfoRuntime. Returns null when there's no possible match.
+     */
+    TvrEdgeOpMatchInfoRuntime compileRuntime(VolcanoRuleCall rc) {
+      Set<TvrSemantics> tvrEdgesMatched =
+          tvrEdgeIndices.stream().map(i -> rc.tvrTraits[i])
+              .collect(Collectors.toSet());
+      return new TvrEdgeOpMatchInfoRuntime(this, tvrEdgesMatched);
+    }
+  }
+
+  /**
+   * Match conditions for a TvrEdge. Computed at run (match) time.
+   */
+  private static class TvrEdgeOpMatchInfoRuntime {
+    TvrEdgeOpMatchInfo staticInfo;
+    Set<TvrSemantics> tvrEdgesMatched;
+
+    TvrEdgeOpMatchInfoRuntime(TvrEdgeOpMatchInfo staticInfo,
+        Set<TvrSemantics> tvrEdgesMatched) {
+      this.staticInfo = staticInfo;
+      this.tvrEdgesMatched = tvrEdgesMatched;
+    }
+
+    boolean matches(TvrSemantics tvrKey, VolcanoRuleCall rc) {
+      return !tvrEdgesMatched.contains(tvrKey) && staticInfo.edgeOp
+          .matches(tvrKey) && staticInfo.timePreds.stream()
+          .allMatch(p -> p.apply(rc, tvrKey));
+    }
+  }
+
+  /**
+   * Match conditions for a TvrMetaSet. Computed once at compile (assign) time.
+   */
+  private static class TvrOpMatchInfo {
+    TvrRelOptRuleOperand tvrOp;
+    Set<Integer> relsForTvrTypeContains;
+    Set<Integer> tvrsForTvrTypeEquals;
+
+    TvrOpMatchInfo(TvrRelOptRuleOperand tvrOp, Set<Integer> assigned) {
+      this.tvrOp = tvrOp;
+
+      // Look at the tvr edges to this tvr operand, and figure out the
+      // tvrTypes requirements
+      this.relsForTvrTypeContains = new HashSet<>();
+      for (TvrEdgeRelOptRuleOperand tvrEdge : tvrOp.tvrChildren) {
+        RelOptRuleOperand relOp = tvrEdge.relOp;
+        if (tvrEdge.enforceTvrType() && assigned.contains(relOp.ordinalInRule)
+            && relOp.getMatchedClass() != RelSubset.class) {
+          relsForTvrTypeContains.add(getRelIndex(relOp));
+        }
+      }
+
+      this.tvrsForTvrTypeEquals = new HashSet<>();
+      tvrOp.getRule().sameTvrType.forEach(tvrOps -> {
+        if (tvrOps.contains(tvrOp)) {
+          for (TvrRelOptRuleOperand tOp : tvrOps) {
+            if (assigned.contains(tOp.ordinalInRule) && tOp != tvrOp) {
+              tvrsForTvrTypeEquals.add(getTvrIndex(tOp));
+              break;
+            }
+          }
+        }
+      });
+    }
+
+    /**
+     * Compute matchInfoRuntime. Returns null when there's no possible match.
+     */
+    TvrOpMatchInfoRuntime compileRuntime(VolcanoRuleCall rc) {
+      Set<TvrMetaSetType> tvrTypeContains = null;
+      for (Integer i : relsForTvrTypeContains) {
+        RelNode rel = rc.rels[i];
+        Set<TvrMetaSetType> types =
+            rc.volcanoPlanner.getGenericRelTvrTypes(rel);
+        assert !types.isEmpty();
+        if (tvrTypeContains == null) {
+          tvrTypeContains = new HashSet<>(types);
+        } else {
+          tvrTypeContains.retainAll(types);
+          if (tvrTypeContains.isEmpty()) {
+            return null;  // TvrType requirements doesn't agree
+          }
+        }
+      }
+
+      TvrMetaSetType tvrTypeEquals = null;
+      for (Integer i : tvrsForTvrTypeEquals) {
+        TvrMetaSet tvr = rc.tvrs[i];
+        if (tvrTypeEquals == null) {
+          tvrTypeEquals = tvr.getTvrType();
+        } else if (!tvr.getTvrType().equals(tvrTypeEquals)) {
+          return null;  // TvrType requirements doesn't agree
+        }
+      }
+      return new TvrOpMatchInfoRuntime(this, tvrTypeContains, tvrTypeEquals);
+    }
+  }
+
+  /**
+   * Match conditions for a TvrMetaSet. Computed at run (match) time.
+   */
+  private static class TvrOpMatchInfoRuntime {
+    TvrOpMatchInfo staticInfo;
+    Set<TvrMetaSetType> tvrTypeContains;  // null means no requirement
+    TvrMetaSetType tvrTypeEquals;   // null means no requirement
+
+    TvrOpMatchInfoRuntime(TvrOpMatchInfo staticInfo,
+        Set<TvrMetaSetType> tvrTypeContains, TvrMetaSetType tvrTypeEquals) {
+      this.staticInfo = staticInfo;
+      this.tvrTypeContains = tvrTypeContains;
+      this.tvrTypeEquals = tvrTypeEquals;
+    }
+
+    boolean matches(TvrMetaSet tvr) {
+      if (tvrTypeContains != null && !tvrTypeContains
+          .contains(tvr.getTvrType())) {
+        return false;
+      }
+      if (tvrTypeEquals != null && !tvr.getTvrType().equals(tvrTypeEquals)) {
+        return false;
+      }
+      return staticInfo.tvrOp.matches(tvr);
+    }
+  }
+
+  /**
+   * Match conditions for a relNode. Computed once at compile (assign) time.
+   */
+  private static class RelOpMatchInfo {
+    RelOptRuleOperand operand;
+    Map<Integer, Integer> tvr2TraitMap;
+    Set<Integer> tvrsFortvrTypeInclude;
+
+    // If this is true, the matched relNode should have a non-null
+    // volcanoPlanner.tvrGenericRels entry
+    boolean hasTvrTypeRequirement;
+
+    RelOpMatchInfo(RelOptRuleOperand operand, Set<Integer> assigned) {
+      this.operand = operand;
+      this.tvr2TraitMap = new HashMap<>();
+      this.tvrsFortvrTypeInclude = new HashSet<>();
+      this.hasTvrTypeRequirement = operand.tvrParents.stream()
+          .anyMatch(TvrEdgeRelOptRuleOperand::enforceTvrType);
+
+      // Look at the tvr edges to this operand that's already matched, and
+      // figure out the RelSet this operand should find its match in, as well
+      // as required TvrMetaSetType.
+      for (TvrEdgeRelOptRuleOperand tvrEdge : operand.tvrParents) {
+        boolean tvrAssigned =
+            assigned.contains(tvrEdge.getTvrOp().ordinalInRule);
+        boolean tvrTraitAssigned = assigned.contains(tvrEdge.ordinalInRule);
+
+        if (tvrAssigned && tvrEdge.enforceTvrType()) {
+          tvrsFortvrTypeInclude.add(getTvrIndex(tvrEdge.tvrOp));
+        }
+
+        if (tvrTraitAssigned && tvrAssigned) {
+          tvr2TraitMap
+              .put(getTvrIndex(tvrEdge.tvrOp), getTvrEdgeIndex(tvrEdge));
+        }
       }
     }
 
-    for (RelNode rel : successors) {
-      if (!operand.matches(rel)) {
-        continue;
-      }
+    /**
+     * Compute matchInfoRuntime. Returns null when there's no possible match.
+     */
+    RelOpMatchInfoRuntime compileRuntime(VolcanoRuleCall rc) {
+      RelSet set = null;
+      Set<TvrMetaSetType> tvrTypesInclude = new HashSet<>();
 
-      if (parentOperand.childPolicy == RelOptRuleOperandChildPolicy.UNORDERED) {
-        // Assign "childRels" if the operand is UNORDERED.
-        // Remarks:
-        // getChildRels is only valid for the case of
-        // RelOptRuleOperandChildPolicy.UNORDERED (See the comments of getChildRels).
-        // For each child in the returned child relNodes:
-        // - If it is matched in the rule, it is set to the matched RelNode (not RelSubset);
-        // - Otherwise, it is set to the corresponding RelSubset
-        if (ascending) {
-          final List<RelNode> inputs = Lists.newArrayList(rel.getInputs());
-          inputs.set(previousOperand.ordinalInParent, previous);
-          setChildRels(rel, inputs);
-        } else {
-          List<RelNode> inputs = getChildRels(previous);
-          if (inputs == null) {
-            inputs = Lists.newArrayList(previous.getInputs());
-          }
-          inputs.set(operand.ordinalInParent, rel);
-          setChildRels(previous, inputs);
-        }
-      } else if (ascending) {
-        // We know that the previous operand was *a* child of its parent,
-        // but now check that it is the *correct* child.
-        final RelSubset input =
-            (RelSubset) rel.getInput(previousOperand.ordinalInParent);
-        List<RelNode> inputRels = input.getRelList();
-        if (!inputRels.contains(previous)) {
-          continue;
+      tvrsFortvrTypeInclude
+          .forEach(i -> tvrTypesInclude.add(rc.tvrs[i].getTvrType()));
+
+      for (Entry<Integer, Integer> e : tvr2TraitMap.entrySet()) {
+        RelSet relSet =
+            rc.tvrs[e.getKey()].getRelSet(rc.tvrTraits[e.getValue()]);
+        assert relSet != null;
+        if (set == null) {
+          set = relSet;
+        } else if (set != relSet) {
+          // Tvr edges already matched won't agree on a relSet, abort
+          return null;
         }
       }
+      return new RelOpMatchInfoRuntime(this, set, tvrTypesInclude);
+    }
+  }
 
-      rels[operandOrdinal] = rel;
-      matchRecurse(solve + 1);
+  /**
+   * Match conditions for a relNode. Computed at run (match) time.
+   */
+  private static class RelOpMatchInfoRuntime {
+    RelOpMatchInfo staticInfo;
+    RelSet set;   // null means no restriction
+
+    // rel's generic tvrTypes must include these
+    Set<TvrMetaSetType> tvrTypesInclude;
+
+    RelOpMatchInfoRuntime(RelOpMatchInfo staticInfo, RelSet set,
+        Set<TvrMetaSetType> tvrTypesInclude) {
+      this.staticInfo = staticInfo;
+      this.set = set;
+      this.tvrTypesInclude = tvrTypesInclude;
+    }
+
+    boolean matches(RelNode rel, VolcanoPlanner volcanoPlanner) {
+      // Check RelSet requirement if any
+      if (set != null && volcanoPlanner.getSet(rel) != set) {
+        return false;
+      }
+      // Check TvrType requirement if any
+      if (!(rel instanceof RelSubset)) {
+        Set<TvrMetaSetType> myTvrTypes =
+            volcanoPlanner.getGenericRelTvrTypes(rel);
+        if (!myTvrTypes.containsAll(tvrTypesInclude)) {
+          return false;
+        }
+        // Extra pruning for future
+        if (staticInfo.hasTvrTypeRequirement && myTvrTypes.isEmpty()) {
+          return false;
+        }
+      }
+      // For leaf operand, make sure the matched RelNode has no children
+      if (staticInfo.operand.childPolicy == RelOptRuleOperandChildPolicy.LEAF
+          && rel.getInputs().size() != 0) {
+        return false;
+      }
+      return staticInfo.operand.matches(rel);
     }
   }
 }
-
 // End VolcanoRuleCall.java

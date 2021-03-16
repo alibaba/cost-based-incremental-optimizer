@@ -56,10 +56,10 @@ import javax.annotation.Nonnull;
 public abstract class RelTraitDef<T extends RelTrait> {
   //~ Instance fields --------------------------------------------------------
 
-  private final LoadingCache<T, T> canonicalMap =
-      CacheBuilder.newBuilder()
+  private final ThreadLocal<LoadingCache<T, T>> canonicalMap =
+      ThreadLocal.withInitial(() -> CacheBuilder.newBuilder()
           .softValues()
-          .build(CacheLoader.from(key -> key));
+          .build(CacheLoader.from(key -> key)));
 
   /** Cache of composite traits.
    *
@@ -68,8 +68,8 @@ public abstract class RelTraitDef<T extends RelTrait> {
    * <p>You can look up using a {@link RelCompositeTrait} whose constituent
    * traits are not canonized.
    */
-  private final LoadingCache<Object, RelCompositeTrait> canonicalCompositeMap =
-      CacheBuilder.newBuilder()
+  private final ThreadLocal<LoadingCache<Object, RelCompositeTrait>> canonicalCompositeMap =
+      ThreadLocal.withInitial(() -> CacheBuilder.newBuilder()
           .softValues()
           .build(
               new CacheLoader<Object, RelCompositeTrait>() {
@@ -83,7 +83,7 @@ public abstract class RelTraitDef<T extends RelTrait> {
                   final RelTraitDef def = list.get(0).getTraitDef();
                   return (RelCompositeTrait) RelCompositeTrait.of(def, list);
                 }
-              });
+              }));
 
   //~ Constructors -----------------------------------------------------------
 
@@ -135,11 +135,11 @@ public abstract class RelTraitDef<T extends RelTrait> {
         + " cannot canonize a "
         + trait.getClass().getName();
 
-    return canonicalMap.getUnchecked(trait);
+    return canonicalMap.get().getUnchecked(trait);
   }
 
   final RelCompositeTrait canonizeComposite(RelCompositeTrait compositeTrait) {
-    return canonicalCompositeMap.getUnchecked(compositeTrait);
+    return canonicalCompositeMap.get().getUnchecked(compositeTrait);
   }
 
   /**

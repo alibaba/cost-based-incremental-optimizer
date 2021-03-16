@@ -16,19 +16,48 @@
  */
 package org.apache.calcite.plan;
 
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
+import org.apache.calcite.plan.volcano.TvrEdgeRelOptRuleOperand;
+import org.apache.calcite.plan.volcano.TvrEdgeTimeMatchInfo;
+import org.apache.calcite.plan.volcano.TvrPropertyEdgeRuleOperand;
+import org.apache.calcite.plan.volcano.TvrRelOptRuleOperand;
+import org.apache.calcite.plan.volcano.VolcanoRuleCall.MatchFirstRelInTree;
+import org.apache.calcite.plan.volcano.VolcanoRuleCall.MatchInitialRel;
+import org.apache.calcite.plan.volcano.VolcanoRuleCall.MatchInitialTvr;
+import org.apache.calcite.plan.volcano.VolcanoRuleCall.MatchInitialTvrEdge;
+import org.apache.calcite.plan.volcano.VolcanoRuleCall.MatchInitialTvrPropertyEdge;
+import org.apache.calcite.plan.volcano.VolcanoRuleCall.MatchNonFirstRel;
+import org.apache.calcite.plan.volcano.VolcanoRuleCall.MatchPropertyEdgeFrom2To;
+import org.apache.calcite.plan.volcano.VolcanoRuleCall.MatchPropertyEdgeOnly;
+import org.apache.calcite.plan.volcano.VolcanoRuleCall.MatchPropertyEdgeTo2From;
+import org.apache.calcite.plan.volcano.VolcanoRuleCall.MatchTvr;
+import org.apache.calcite.plan.volcano.VolcanoRuleCall.MatchTvrEdgeOnly;
+import org.apache.calcite.plan.volcano.VolcanoRuleCall.MatchTvrEdgeRel2Tvr;
+import org.apache.calcite.plan.volcano.VolcanoRuleCall.MatchTvrEdgeTvr2Rel;
+import org.apache.calcite.plan.volcano.VolcanoRuleCall.OperandMatch;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.convert.Converter;
 import org.apache.calcite.rel.convert.ConverterRule;
 import org.apache.calcite.rel.core.RelFactories;
 import org.apache.calcite.tools.RelBuilderFactory;
-
-import com.google.common.collect.ImmutableList;
-import com.google.common.collect.Lists;
+import org.apache.calcite.util.IdentityArrayList;
+import org.apache.calcite.util.Pair;
+import org.apache.calcite.util.trace.CalciteTrace;
+import org.slf4j.Logger;
 
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.function.Predicate;
+import java.util.stream.Collectors;
 
 /**
  * A <code>RelOptRule</code> transforms an expression into another. It has a
@@ -40,6 +69,7 @@ import java.util.function.Predicate;
  */
 public abstract class RelOptRule {
   //~ Static fields/initializers ---------------------------------------------
+  protected static final Logger LOGGER = CalciteTrace.getPlannerTracer();
 
   //~ Instance fields --------------------------------------------------------
 
@@ -51,9 +81,29 @@ public abstract class RelOptRule {
   protected final String description;
 
   /**
-   * Root of operand tree.
+   * Roots of operand trees.
    */
-  private final RelOptRuleOperand operand;
+  public final List<RelOptRuleOperand> operandRoots;
+
+  /**
+   * Total number of normal RelOptRuleOperand matching for a relNode.
+   */
+  int relOperandCount;
+
+  /**
+   * Tvr operands, whose child operands must be in the trees of operandRoots.
+   */
+  public final List<TvrRelOptRuleOperand> tvrOperands;
+
+  /**
+   * Tvr edge operands, connecting RelNode operands and Tvr operands.
+   */
+  public final List<TvrEdgeRelOptRuleOperand> tvrEdgeOperands;
+
+  /**
+   * Tvr property edge operands, directed edge between two Tvr operands.
+   */
+  public final List<TvrPropertyEdgeRuleOperand> tvrPropertyEdgeOperands;
 
   /** Factory for a builder for relational expressions.
    *
@@ -61,9 +111,24 @@ public abstract class RelOptRule {
   public final RelBuilderFactory relBuilderFactory;
 
   /**
-   * Flattened list of operands.
+   * Flattened list of operands. Operand trees are flattened in pre-order first
+   * one by one, then TvrRelOptRuleOperands, TvrEdgeRelOptRuleOperand and
+   * TvrPropertyEdgeOperands.
    */
   public final List<RelOptRuleOperand> operands;
+
+  /**
+   * Whether all tvrOps in the rule should match the same TvrType. Default is
+   * true.
+   */
+  public Collection<IdentityArrayList<TvrRelOptRuleOperand>>
+      sameTvrType;
+
+  public Collection<IdentityArrayList<TvrEdgeRelOptRuleOperand>>
+      identicalTimeEdges;
+
+  public Collection<IdentityArrayList<TvrEdgeRelOptRuleOperand>>
+      adjacentTimeEdges;
 
   //~ Constructors -----------------------------------------------------------
 
@@ -95,8 +160,49 @@ public abstract class RelOptRule {
    */
   public RelOptRule(RelOptRuleOperand operand,
       RelBuilderFactory relBuilderFactory, String description) {
-    this.operand = Objects.requireNonNull(operand);
-    this.relBuilderFactory = Objects.requireNonNull(relBuilderFactory);
+    Objects.requireNonNull(operand);
+    Objects.requireNonNull(relBuilderFactory);
+
+    Pair<List<RelOptRuleOperand>, List<TvrRelOptRuleOperand>> roots =
+        findTvrOpRoots(operand);
+    this.operandRoots = ImmutableList.copyOf(roots.left);
+    this.tvrOperands = ImmutableList.copyOf(roots.right);
+    // Order of edge operands are derived from order of tvr operands
+    this.tvrEdgeOperands = ImmutableList.copyOf(
+        tvrOperands.stream().flatMap(t -> t.tvrChildren.stream()).iterator());
+    this.tvrPropertyEdgeOperands = ImmutableList.copyOf(tvrOperands.stream()
+        .flatMap(t -> t.tvrPropertyEdges.stream().filter(e -> e.isFromTvrOp(t)))
+        .iterator());
+
+    if (this.tvrOperands.stream().anyMatch(tvrOp -> !tvrOp.sameTvrType)) {
+      sameTvrType = ImmutableList.of();
+    } else {
+      sameTvrType = ImmutableList.of(new IdentityArrayList<>(this.tvrOperands));
+    }
+
+    Map<TvrEdgeTimeMatchInfo, IdentityArrayList<TvrEdgeRelOptRuleOperand>>
+        identical = new HashMap<>();
+    Map<TvrEdgeTimeMatchInfo, IdentityArrayList<TvrEdgeRelOptRuleOperand>>
+        adjacent = new HashMap<>();
+    tvrOperands.forEach(tvr -> tvr.tvrChildren.forEach(tvrEdge -> {
+      List<TvrEdgeTimeMatchInfo> matchInfoList = tvrEdge.getTimeInfoList();
+      matchInfoList.forEach(matchInfo -> {
+        switch (matchInfo.policy) {
+        case IDENTICAL:
+          identical.computeIfAbsent(matchInfo, x -> new IdentityArrayList<>())
+              .add(tvrEdge);
+          break;
+        case ADJACENT:
+          adjacent.computeIfAbsent(matchInfo, x -> new IdentityArrayList<>())
+              .add(tvrEdge);
+          break;
+        }
+      });
+    }));
+    this.identicalTimeEdges = identical.values();
+    this.adjacentTimeEdges = adjacent.values();
+
+    this.relBuilderFactory = relBuilderFactory;
     if (description == null) {
       description = guessDescription(getClass().getName());
     }
@@ -105,8 +211,49 @@ public abstract class RelOptRule {
           + "' is not valid");
     }
     this.description = description;
-    this.operands = flattenOperands(operand);
+    this.operands = flattenOperands();
     assignSolveOrder();
+  }
+
+  private static Pair<List<RelOptRuleOperand>, List<TvrRelOptRuleOperand>> findTvrOpRoots(
+      RelOptRuleOperand root) {
+    List<RelOptRuleOperand> relRoots = new ArrayList<>();
+    List<TvrRelOptRuleOperand> tvrRoots = new ArrayList<>();
+
+    visit(root, relRoots, tvrRoots, Sets.newIdentityHashSet());
+    return Pair.of(relRoots, tvrRoots);
+  }
+
+  private static void visit(RelOptRuleOperand op,
+      List<RelOptRuleOperand> relRoots, List<TvrRelOptRuleOperand> tvrRoots,
+      Set<RelOptRuleOperand> visited) {
+    if (visited.contains(op)) {
+      return;
+    }
+    visited.add(op);
+    if (op instanceof TvrRelOptRuleOperand) {
+      TvrRelOptRuleOperand tvrOp = (TvrRelOptRuleOperand) op;
+      tvrRoots.add(tvrOp);
+
+      tvrOp.tvrChildren
+          .forEach(edge -> visit(edge.getRelOp(), relRoots, tvrRoots, visited));
+      tvrOp.tvrPropertyEdges.forEach(edge -> {
+        visit(edge.getFromTvrOp(), relRoots, tvrRoots, visited);
+        visit(edge.getToTvrOp(), relRoots, tvrRoots, visited);
+      });
+    } else {
+      assert op.getClass() != TvrEdgeRelOptRuleOperand.class
+          && op.getClass() != TvrPropertyEdgeRuleOperand.class;
+      if (op.getParent() == null) {
+        relRoots.add(op);
+      } else {
+        visit(op.getParent(), relRoots, tvrRoots, visited);
+      }
+      op.getChildOperands()
+          .forEach(child -> visit(child, relRoots, tvrRoots, visited));
+      op.tvrParents
+          .forEach(edge -> visit(edge.getTvrOp(), relRoots, tvrRoots, visited));
+    }
   }
 
   //~ Methods for creating operands ------------------------------------------
@@ -338,23 +485,51 @@ public abstract class RelOptRule {
   //~ Methods ----------------------------------------------------------------
 
   /**
-   * Creates a flattened list of this operand and its descendants in prefix
-   * order.
+   * Flatten operands. Operand trees are flattened in pre-order first one by
+   * one, then TvrRelOptRuleOperands in the middle, then
+   * TvrEdgeRelOptRuleOperand in the end.
    *
-   * @param rootOperand Root operand
    * @return Flattened list of operands
    */
-  private List<RelOptRuleOperand> flattenOperands(
-      RelOptRuleOperand rootOperand) {
+  private List<RelOptRuleOperand> flattenOperands() {
     final List<RelOptRuleOperand> operandList = new ArrayList<>();
 
-    // Flatten the operands into a list.
-    rootOperand.setRule(this);
-    rootOperand.setParent(null);
-    rootOperand.ordinalInParent = 0;
-    rootOperand.ordinalInRule = operandList.size();
-    operandList.add(rootOperand);
-    flattenRecurse(operandList, rootOperand);
+    // Flatten the operands trees one by one in pre-order first
+    for (RelOptRuleOperand rootOperand : operandRoots) {
+      rootOperand.setRule(this);
+      rootOperand.setParent(null);
+      rootOperand.ordinalInParent = 0;
+      assert rootOperand.ordinalInRule == 0;
+      rootOperand.ordinalInRule = operandList.size();
+      operandList.add(rootOperand);
+      flattenRecurse(operandList, rootOperand);
+    }
+    relOperandCount = operandList.size();
+
+    // TvrOperands
+    for (TvrRelOptRuleOperand tvrOp : tvrOperands) {
+      tvrOp.setRule(this);
+      assert tvrOp.ordinalInRule == 0;
+      tvrOp.ordinalInRule = operandList.size();
+      operandList.add(tvrOp);
+    }
+
+    // TvrEdgeOperands
+    for (TvrEdgeRelOptRuleOperand edgeOp : tvrEdgeOperands) {
+      edgeOp.setRule(this);
+      assert edgeOp.ordinalInRule == 0;
+      edgeOp.ordinalInRule = operandList.size();
+      operandList.add(edgeOp);
+    }
+
+    // TvrPropertyEdgeOperands in the end
+    for (TvrPropertyEdgeRuleOperand propertyOp : tvrPropertyEdgeOperands) {
+      propertyOp.setRule(this);
+      assert propertyOp.ordinalInRule == 0;
+      propertyOp.ordinalInRule = operandList.size();
+      operandList.add(propertyOp);
+    }
+
     return ImmutableList.copyOf(operandList);
   }
 
@@ -364,14 +539,14 @@ public abstract class RelOptRule {
    * @param operandList   Flattened list of operands
    * @param parentOperand Parent of this operand
    */
-  private void flattenRecurse(
-      List<RelOptRuleOperand> operandList,
+  private void flattenRecurse(List<RelOptRuleOperand> operandList,
       RelOptRuleOperand parentOperand) {
     int k = 0;
     for (RelOptRuleOperand operand : parentOperand.getChildOperands()) {
       operand.setRule(this);
       operand.setParent(parentOperand);
       operand.ordinalInParent = k++;
+      assert operand.ordinalInRule == 0;
       operand.ordinalInRule = operandList.size();
       operandList.add(operand);
       flattenRecurse(operandList, operand);
@@ -379,30 +554,211 @@ public abstract class RelOptRule {
   }
 
   /**
-   * Builds each operand's solve-order. Start with itself, then its parent, up
-   * to the root, then the remaining operands in prefix order.
+   * Builds each operand's solve-order.
    */
   private void assignSolveOrder() {
+    LOGGER.trace("Printing solveOrder for {}", this.description);
     for (RelOptRuleOperand operand : operands) {
-      operand.solveOrder = new int[operands.size()];
-      int m = 0;
-      for (RelOptRuleOperand o = operand; o != null; o = o.getParent()) {
-        operand.solveOrder[m++] = o.ordinalInRule;
+      LOGGER.trace("Ordinal {} {}, match class {}", operand.ordinalInRule,
+          operand.getClass(), operand.getMatchedClass());
+    }
+    int i = 0;
+    for (RelOptRuleOperand operand : operands) {
+      operand.solveOrder = new ArrayList<>();
+      Set<Integer> assigned = new HashSet<>();
+      assignRecursive(operand.solveOrder, assigned, operand,
+          operandZeroMatch(operand, assigned));
+      assert operand.solveOrder.size() == operands.size();
+
+      if (LOGGER.isTraceEnabled()) {
+        StringBuilder sb = new StringBuilder("Operand ").append(i).append(" solve order: ");
+        for (OperandMatch opMatch : operand.solveOrder) {
+          sb.append(opMatch.getOperandOrdInRule()).append(", ");
+        }
+        i++;
+        LOGGER.trace(sb.toString());
       }
-      for (int k = 0; k < operands.size(); k++) {
-        boolean exists = false;
-        for (int n = 0; n < m; n++) {
-          if (operand.solveOrder[n] == k) {
-            exists = true;
-          }
-        }
-        if (!exists) {
-          operand.solveOrder[m++] = k;
-        }
+    }
+  }
+
+  /**
+   * Assumptions on solve order:
+   *
+   * 1. Once the first edge from/to a TvrOp is assigned, we always assign the
+   * TvrOp immediately afterwards.
+   */
+  private void assignRecursive(List<OperandMatch> solveOrder,
+      Set<Integer> assigned, RelOptRuleOperand operand, OperandMatch opMatch) {
+    if (assigned.contains(operand.ordinalInRule)) {
+      return;
+    }
+    assigned.add(operand.ordinalInRule);
+    solveOrder.add(opMatch);
+
+    expandRecursive(solveOrder, assigned, operand);
+  }
+
+  private void expandRecursive(List<OperandMatch> solveOrder,
+      Set<Integer> assigned, RelOptRuleOperand operand) {
+
+    if (operand instanceof TvrRelOptRuleOperand) {
+      TvrRelOptRuleOperand tvrOp = (TvrRelOptRuleOperand) operand;
+
+      tvrOp.tvrPropertyEdges.forEach(
+          propertyEdge -> assignRecursive(solveOrder, assigned, propertyEdge,
+              propertyEdgeMatch(propertyEdge, assigned)));
+      tvrOp.tvrChildren.forEach(
+          tvrEdgeOp -> assignRecursive(solveOrder, assigned, tvrEdgeOp,
+              tvrEdgeMatch(tvrEdgeOp, assigned)));
+      return;
+    }
+
+    if (operand instanceof TvrPropertyEdgeRuleOperand) {
+      TvrPropertyEdgeRuleOperand propertyOp =
+          (TvrPropertyEdgeRuleOperand) operand;
+      if (!assigned.contains(propertyOp.getFromTvrOp().ordinalInRule)
+          && !assigned.contains(propertyOp.getToTvrOp().ordinalInRule)) {
+        // A special treatment of op0 being a property edge
+        assert assigned.size() == 1;
+
+        // Assign toTvr without expanding
+        assigned.add(propertyOp.getToTvrOp().ordinalInRule);
+        solveOrder.add(tvrMatch(propertyOp.getToTvrOp(), assigned));
+
+        // Assign and expand fromTvr
+        assignRecursive(solveOrder, assigned, propertyOp.getFromTvrOp(),
+            tvrMatch(propertyOp.getFromTvrOp(), assigned));
+
+        // Expand toTvr
+        expandRecursive(solveOrder, assigned, propertyOp.getToTvrOp());
+        return;
       }
 
-      // Assert: operand appears once in the sort-order.
-      assert m == operands.size();
+      // One end is already assigned, just try both ends
+      assignRecursive(solveOrder, assigned, propertyOp.getFromTvrOp(),
+          tvrMatch(propertyOp.getFromTvrOp(), assigned));
+      assignRecursive(solveOrder, assigned, propertyOp.getToTvrOp(),
+          tvrMatch(propertyOp.getToTvrOp(), assigned));
+      return;
+    }
+
+    if (operand instanceof TvrEdgeRelOptRuleOperand) {
+      TvrEdgeRelOptRuleOperand edgeOp = (TvrEdgeRelOptRuleOperand) operand;
+      // Try tvrOp immediately first
+      assignRecursive(solveOrder, assigned, edgeOp.getTvrOp(),
+          tvrMatch(edgeOp.getTvrOp(), assigned));
+      assignRecursive(solveOrder, assigned, edgeOp.getRelOp(),
+          firstRelMatch(edgeOp.getRelOp(), assigned));
+      return;
+    }
+
+    /*
+     * Normal operand, two steps:
+     * 1. Expand its whole tree: travel up to root and then the remaining tree
+     * in pre-order.
+     * 2. Expand all the tvrOperand links from this operand tree.
+     */
+    RelOptRuleOperand root = null;
+    List<TvrEdgeRelOptRuleOperand> tvrLinks =
+        new ArrayList<>(operand.tvrParents);
+    for (RelOptRuleOperand o = operand; o != null; o = o.getParent()) {
+      assignNonFirstRelOperand(solveOrder, assigned, tvrLinks, o);
+      root = o;
+    }
+
+    int endingOrdinalForRoot = endingOrdinalInRuleForTree(root);
+    for (int k = root.ordinalInRule; k < endingOrdinalForRoot; k++) {
+      RelOptRuleOperand o = operands.get(k);
+      assignNonFirstRelOperand(solveOrder, assigned, tvrLinks, o);
+    }
+
+    // Expand to other trees from collected tvr links
+    tvrLinks.forEach(
+        tvrEdgeOp -> assignRecursive(solveOrder, assigned, tvrEdgeOp,
+            tvrEdgeMatch(tvrEdgeOp, assigned)));
+  }
+
+  private void assignNonFirstRelOperand(List<OperandMatch> solveOrder,
+      Set<Integer> assigned, List<TvrEdgeRelOptRuleOperand> tvrLinks,
+      RelOptRuleOperand operand) {
+    if (assigned.contains(operand.ordinalInRule)) {
+      return;
+    }
+    assigned.add(operand.ordinalInRule);
+    solveOrder.add(nonFirstRelMatch(operand, assigned));
+
+    // Remember all tvr edges coming out of this operand
+    tvrLinks.addAll(operand.tvrParents);
+  }
+
+  private OperandMatch operandZeroMatch(RelOptRuleOperand op0,
+      Set<Integer> assigned) {
+    if (op0 instanceof TvrRelOptRuleOperand) {
+      return new MatchInitialTvr((TvrRelOptRuleOperand) op0, assigned);
+    }
+    if (op0 instanceof TvrEdgeRelOptRuleOperand) {
+      return new MatchInitialTvrEdge((TvrEdgeRelOptRuleOperand) op0, assigned);
+    }
+    if (op0 instanceof TvrPropertyEdgeRuleOperand) {
+      return new MatchInitialTvrPropertyEdge((TvrPropertyEdgeRuleOperand) op0);
+    }
+    return new MatchInitialRel(op0, assigned);
+  }
+
+  private OperandMatch firstRelMatch(RelOptRuleOperand relOp,
+      Set<Integer> assigned) {
+    return new MatchFirstRelInTree(relOp, assigned);
+  }
+
+  private OperandMatch nonFirstRelMatch(RelOptRuleOperand relOp,
+      Set<Integer> assigned) {
+    return new MatchNonFirstRel(relOp, assigned);
+  }
+
+  private OperandMatch tvrMatch(TvrRelOptRuleOperand tvrOp,
+      Set<Integer> assigned) {
+    return new MatchTvr(tvrOp, assigned);
+  }
+
+  private OperandMatch tvrEdgeMatch(TvrEdgeRelOptRuleOperand tvrEdgeOp,
+      Set<Integer> assigned) {
+    if (assigned.contains(tvrEdgeOp.getTvrOp().ordinalInRule)) {
+      if (assigned.contains(tvrEdgeOp.getRelOp().ordinalInRule)) {
+        return new MatchTvrEdgeOnly(tvrEdgeOp, assigned);
+      }
+      return new MatchTvrEdgeTvr2Rel(tvrEdgeOp, assigned);
+    }
+    return new MatchTvrEdgeRel2Tvr(tvrEdgeOp, assigned);
+  }
+
+  private OperandMatch propertyEdgeMatch(
+      TvrPropertyEdgeRuleOperand propertyEdgeOp, Set<Integer> assigned) {
+    if (assigned.contains(propertyEdgeOp.getToTvrOp().ordinalInRule)) {
+      if (assigned.contains(propertyEdgeOp.getFromTvrOp().ordinalInRule)) {
+        return new MatchPropertyEdgeOnly(propertyEdgeOp);
+      }
+      return new MatchPropertyEdgeTo2From(propertyEdgeOp);
+    }
+    return new MatchPropertyEdgeFrom2To(propertyEdgeOp);
+  }
+
+  private int endingOrdinalInRuleForTree(RelOptRuleOperand root) {
+    assert operandRoots.contains(root);
+    RelOptRuleOperand op;
+    Iterator<RelOptRuleOperand> iter = operandRoots.iterator();
+    while (iter.hasNext()) {
+      op = iter.next();
+      if (op == root) {
+        break;
+      }
+    }
+    if (iter.hasNext()) {
+      // Get the ordinal of the root after me
+      op = iter.next();
+      return op.ordinalInRule;
+    } else {
+      // I am the last operand root
+      return relOperandCount;
     }
   }
 
@@ -412,7 +768,7 @@ public abstract class RelOptRule {
    * @return the root operand of this rule
    */
   public RelOptRuleOperand getOperand() {
-    return operand;
+    return operandRoots.get(0);
   }
 
   /**
@@ -451,7 +807,10 @@ public abstract class RelOptRule {
     // they have chosen a poor description.
     return this.description.equals(that.description)
         && (this.getClass() == that.getClass())
-        && this.operand.equals(that.operand);
+        && this.operands.equals(that.operands)
+        && this.sameTvrType.equals(that.sameTvrType)
+        && this.identicalTimeEdges.equals(that.identicalTimeEdges)
+        && this.adjacentTimeEdges.equals(that.adjacentTimeEdges);
   }
 
   /**
@@ -540,6 +899,38 @@ public abstract class RelOptRule {
    * a letter. */
   public final String toString() {
     return description;
+  }
+
+  public int getMatchingRelCount() {
+    return relOperandCount;
+  }
+
+  public int getMatchingTvrCount() {
+    return tvrOperands.size();
+  }
+
+  public int getMatchingTvrEdgeCount() {
+    return tvrEdgeOperands.size();
+  }
+
+  public int getMatchingTvrPropertyEdgeCount() {
+    return tvrPropertyEdgeOperands.size();
+  }
+
+  public int getRelOpStartIndex() {
+    return 0;
+  }
+
+  public int getTvrOpStartIndex() {
+    return getRelOpStartIndex() + getMatchingRelCount();
+  }
+
+  public int getTvrEdgeOpStartIndex() {
+    return getTvrOpStartIndex() + getMatchingTvrCount();
+  }
+
+  public int getTvrPropertyEdgeOpStartIndex() {
+    return getTvrEdgeOpStartIndex() + getMatchingTvrEdgeCount();
   }
 
   /**

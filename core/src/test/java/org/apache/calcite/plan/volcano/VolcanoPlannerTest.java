@@ -23,11 +23,17 @@ import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptListener;
 import org.apache.calcite.plan.RelOptRule;
 import org.apache.calcite.plan.RelOptRuleCall;
+import org.apache.calcite.plan.RelOptRuleOperand;
 import org.apache.calcite.plan.RelTraitSet;
+import org.apache.calcite.plan.tvr.TvrSemantics;
+import org.apache.calcite.plan.tvr.TvrVersion;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.convert.ConverterImpl;
 import org.apache.calcite.rel.convert.ConverterRule;
+import org.apache.calcite.rel.core.Join;
 import org.apache.calcite.rel.core.RelFactories;
+import org.apache.calcite.rel.core.TableScan;
+import org.apache.calcite.rel.core.Union;
 import org.apache.calcite.rel.logical.LogicalProject;
 import org.apache.calcite.rel.rules.ProjectRemoveRule;
 import org.apache.calcite.tools.RelBuilder;
@@ -40,6 +46,8 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 
+import static org.apache.calcite.plan.RelOptRule.any;
+import static org.apache.calcite.plan.RelOptRule.operand;
 import static org.apache.calcite.plan.volcano.PlannerTests.GoodSingleRule;
 import static org.apache.calcite.plan.volcano.PlannerTests.NoneLeafRel;
 import static org.apache.calcite.plan.volcano.PlannerTests.NoneSingleRel;
@@ -63,6 +71,189 @@ import static org.junit.Assert.assertTrue;
 public class VolcanoPlannerTest {
 
   public VolcanoPlannerTest() {
+  }
+
+  static TvrSemantics SNAPSHOT =
+      new TvrSemantics(TvrVersion.MIN, TvrVersion.MAX) {
+        @Override
+        public boolean equals(Object obj) {
+          return this == obj;
+        }
+
+        @Override
+        public String toString() {
+          return "snapshot";
+        }
+
+        @Override
+        public TvrSemantics copy(TvrVersion from, TvrVersion to) {
+          return this;
+        }
+      };
+
+  static TvrSemantics DELTA = new TvrSemantics(TvrVersion.MIN, TvrVersion.MAX) {
+    @Override
+    public boolean equals(Object obj) {
+      return this == obj;
+    }
+
+    @Override
+    public String toString() {
+      return "delta";
+    }
+
+    @Override
+    public TvrSemantics copy(TvrVersion from, TvrVersion to) {
+      return this;
+    }
+  };
+
+  private static class PrintTvrMatchRule extends RelOptRule {
+    PrintTvrMatchRule(RelOptRuleOperand operand) {
+      super(operand);
+    }
+
+    public void onMatch(RelOptRuleCall call) {
+      int i = 0;
+      for (RelNode rel : call.rels) {
+        System.out.println("Rel " + i + ": " + rel);
+        i++;
+      }
+      for (TvrMetaSet tvr : call.tvrs) {
+        System.out.println("Tvr " + i + ": " + tvr);
+        i++;
+      }
+    }
+  }
+
+  @Test
+  public void testPrintTvrRule() {
+    VolcanoPlanner planner = new VolcanoPlanner();
+    planner.addRelTraitDef(ConventionTraitDef.INSTANCE);
+
+    RelOptRuleOperand leftOp = operand(NoneLeafRel.class, any());
+    RelOptRuleOperand rightOp = operand(PhysLeafRel.class, any());
+    RelOptRuleOperand singleOp = operand(Join.class, leftOp, rightOp);
+
+    RelOptRuleOperand childOp = operand(TableScan.class, any());
+    RelOptRuleOperand parentOp = operand(NoneSingleRel.class, childOp);
+
+    RelOptRuleOperand op = operand(Union.class, any());
+
+    TvrRelOptRuleOperand tvr1 = new TvrRelOptRuleOperand();
+    tvr1.addTvrConnection(TvrSemantics.class,
+        TvrSemantics.SET_SNAPSHOT_MAX::equals, null, leftOp, false);
+    tvr1.addTvrConnection(TvrSemantics.class, x -> DELTA.equals(x), null,
+        parentOp, false);
+
+    TvrRelOptRuleOperand tvr2 = new TvrRelOptRuleOperand();
+    tvr2.addTvrConnection(TvrSemantics.class,
+        TvrSemantics.SET_SNAPSHOT_MAX::equals, null, parentOp, false);
+    tvr2.addTvrConnection(TvrSemantics.class, x -> DELTA.equals(x), null,
+        childOp, false);
+    tvr2.addTvrConnection(TvrSemantics.class, x -> SNAPSHOT.equals(x), null, op,
+        false);
+
+    tvr1.addTvrPropertyEdge(TvrProperty.class, x -> true, tvr2);
+    tvr2.addTvrPropertyEdge(TvrProperty.class, x -> true, tvr1);
+
+    planner.addRule(new PrintTvrMatchRule(op));
+
+    planner.addRule(new PhysLeafRule());
+
+    RelOptCluster cluster = newCluster(planner);
+    NoneLeafRel leafRel = new NoneLeafRel(cluster, "a");
+    RelNode convertedRel = planner
+        .changeTraits(leafRel, cluster.traitSetOf(PHYS_CALLING_CONVENTION));
+    planner.setRoot(convertedRel);
+    RelNode result = planner.chooseDelegate().findBestExp();
+    assertTrue(result instanceof PhysLeafRel);
+  }
+
+  private static class LeafSnapshotRule extends RelOptRule {
+    private LeafSnapshotRule(RelOptRuleOperand operand) {
+      super(operand);
+    }
+
+    @Override
+    public void onMatch(RelOptRuleCall call) {
+      System.out.println("LeafSnapshotRule matched");
+
+      TvrMetaSet tvr = call.tvrs[0];
+      PhysLeafRel newleafRel =
+          new PhysLeafRel(call.rels[0].getCluster(), "snapshot");
+
+      assert call.tvrTraits[0] == TvrSemantics.SET_SNAPSHOT_MAX;
+      call.transformBuilder().addTvrLink(newleafRel, SNAPSHOT, tvr).transform();
+    }
+
+    public static LeafSnapshotRule createInstance() {
+      RelOptRuleOperand leaf = operand(PhysLeafRel.class, any());
+      TvrRelOptRuleOperand tvr = new TvrRelOptRuleOperand();
+      tvr.addTvrConnection(TvrSemantics.class,
+          TvrSemantics.SET_SNAPSHOT_MAX::equals, null, leaf, false);
+      return new LeafSnapshotRule(leaf);
+    }
+  }
+
+  private static class SingleRelSnapshotRule extends RelOptRule {
+    private SingleRelSnapshotRule(RelOptRuleOperand operand) {
+      super(operand);
+    }
+
+    @Override
+    public void onMatch(RelOptRuleCall call) {
+      System.out.println("SingleRelSnapshotRule matched");
+
+      PhysLeafRel leafSnapshotRel = (PhysLeafRel) call.rels[2];
+      TvrMetaSet parentTvr = call.tvrs[1];
+
+      assert call.tvrTraits[0] == TvrSemantics.SET_SNAPSHOT_MAX;
+      assert call.tvrTraits[1] == SNAPSHOT;
+      assert call.tvrTraits[2] == TvrSemantics.SET_SNAPSHOT_MAX;
+
+      PhysSingleRel newParentRel =
+          new PhysSingleRel(leafSnapshotRel.getCluster(), leafSnapshotRel);
+      call.transformBuilder().addTvrLink(newParentRel, SNAPSHOT, parentTvr)
+          .transform();
+    }
+
+    public static SingleRelSnapshotRule createInstance() {
+      RelOptRuleOperand leafAny = operand(PhysLeafRel.class, any());
+      RelOptRuleOperand parentAny = operand(PhysSingleRel.class, leafAny);
+      RelOptRuleOperand leafSnapshot = operand(PhysLeafRel.class, any());
+
+      TvrRelOptRuleOperand leafTvr = new TvrRelOptRuleOperand();
+      TvrRelOptRuleOperand parentTvr = new TvrRelOptRuleOperand();
+      leafTvr.addTvrConnection(TvrSemantics.class,
+          TvrSemantics.SET_SNAPSHOT_MAX::equals, null, leafAny, false);
+      leafTvr
+          .addTvrConnection(TvrSemantics.class, x -> SNAPSHOT.equals(x), null,
+              leafSnapshot, false);
+      parentTvr.addTvrConnection(TvrSemantics.class,
+          TvrSemantics.SET_SNAPSHOT_MAX::equals, null, parentAny, false);
+
+      return new SingleRelSnapshotRule(parentAny);
+    }
+  }
+
+  @Test
+  public void testTvrRuleMatch() {
+    VolcanoPlanner planner = new VolcanoPlanner();
+    planner.addRelTraitDef(ConventionTraitDef.INSTANCE);
+
+    planner.addRule(LeafSnapshotRule.createInstance());
+    planner.addRule(SingleRelSnapshotRule.createInstance());
+
+    RelOptCluster cluster = newCluster(planner);
+    PhysLeafRel leafRel = new PhysLeafRel(cluster, "a");
+    PhysSingleRel singleRel = new PhysSingleRel(cluster, leafRel);
+
+    RelNode target = planner.getOrCreateSetFromTvrSet(singleRel, TvrMetaSetType.DEFAULT, SNAPSHOT,
+        singleRel.deriveRowType(), cluster.traitSetOf(PHYS_CALLING_CONVENTION));
+    planner.setRoot(target);
+    RelNode result = planner.chooseDelegate().findBestExp();
+    assertTrue(result instanceof PhysSingleRel);
   }
 
   //~ Methods ----------------------------------------------------------------

@@ -69,6 +69,10 @@ public class RelMdRowCount
 
   public Double getRowCount(RelSubset subset, RelMetadataQuery mq) {
     if (!Bug.CALCITE_1048_FIXED) {
+      // best and original is null: subset is not initialized, return infinity
+      if (subset.getBest() == null && subset.getOriginal() == null) {
+        return Double.POSITIVE_INFINITY;
+      }
       return mq.getRowCount(Util.first(subset.getBest(), subset.getOriginal()));
     }
     Double v = null;

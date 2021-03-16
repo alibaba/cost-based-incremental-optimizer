@@ -16,6 +16,7 @@
  */
 package org.apache.calcite.plan.volcano;
 
+import com.google.common.collect.SetMultimap;
 import org.apache.calcite.linq4j.Linq4j;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptCost;
@@ -24,6 +25,7 @@ import org.apache.calcite.plan.RelOptPlanner;
 import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.plan.RelTrait;
 import org.apache.calcite.plan.RelTraitSet;
+import org.apache.calcite.plan.tvr.TvrSemantics;
 import org.apache.calcite.rel.AbstractRelNode;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.RelWriter;
@@ -46,6 +48,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Queue;
 import java.util.Set;
+import java.util.stream.Stream;
 
 /**
  * Subset of an equivalence class where all relational expressions have the
@@ -145,6 +148,10 @@ public class RelSubset extends AbstractRelNode {
     return set.rel;
   }
 
+  public SetMultimap<TvrSemantics, TvrMetaSet> getTvrLinks() {
+    return this.set.tvrLinks;
+  }
+
   public RelNode copy(RelTraitSet traitSet, List<RelNode> inputs) {
     if (inputs.isEmpty()) {
       final RelTraitSet traitSet1 = traitSet.simplify();
@@ -171,13 +178,12 @@ public class RelSubset extends AbstractRelNode {
   @Override public void explain(RelWriter pw) {
     // Not a typical implementation of "explain". We don't gather terms &
     // values to be printed later. We actually do the work.
-    String s = getDescription();
-    pw.item("subset", s);
     final AbstractRelNode input =
         (AbstractRelNode) Util.first(getBest(), getOriginal());
     if (input == null) {
       return;
     }
+    pw.item("subset", getDescription());
     input.explainTerms(pw);
     pw.done(input);
   }
@@ -192,7 +198,7 @@ public class RelSubset extends AbstractRelNode {
   }
 
   @Override protected RelDataType deriveRowType() {
-    return set.rel.getRowType();
+    return set.getRowType();
   }
 
   /**
@@ -420,6 +426,16 @@ public class RelSubset extends AbstractRelNode {
       }
     }
     return list;
+  }
+
+  public Stream<RelSubset> getSubsetsSatisfingThis() {
+    return set.subsets.stream()
+        .filter(s -> s.getTraitSet().satisfies(traitSet));
+  }
+
+  public Stream<RelSubset> getSatisfyingSubsets() {
+    return set.subsets.stream()
+        .filter(s -> traitSet.satisfies(s.getTraitSet()));
   }
 
   //~ Inner Classes ----------------------------------------------------------
