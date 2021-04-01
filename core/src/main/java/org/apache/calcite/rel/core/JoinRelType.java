@@ -22,7 +22,53 @@ import java.util.Locale;
  * Enumeration of join types.
  */
 public enum JoinRelType {
-  INNER, LEFT, RIGHT, FULL;
+  /**
+   * Inner join.
+   */
+  INNER,
+
+  /**
+   * Left-outer join.
+   */
+  LEFT,
+
+  /**
+   * Right-outer join.
+   */
+  RIGHT,
+
+  /**
+   * Full-outer join.
+   */
+  FULL,
+
+  /**
+   * Semi-join.
+   *
+   * <p>For example, {@code EMP semi-join DEPT} finds all {@code EMP} records
+   * that have a corresponding {@code DEPT} record:
+   *
+   * <blockquote><pre>
+   * SELECT * FROM EMP
+   * WHERE EXISTS (SELECT 1 FROM DEPT
+   *     WHERE DEPT.DEPTNO = EMP.DEPTNO)</pre>
+   * </blockquote>
+   */
+  SEMI,
+
+  /**
+   * Anti-join (also known as Anti-semi-join).
+   *
+   * <p>For example, {@code EMP anti-join DEPT} finds all {@code EMP} records
+   * that do not have a corresponding {@code DEPT} record:
+   *
+   * <blockquote><pre>
+   * SELECT * FROM EMP
+   * WHERE NOT EXISTS (SELECT 1 FROM DEPT
+   *     WHERE DEPT.DEPTNO = EMP.DEPTNO)</pre>
+   * </blockquote>
+   */
+  ANTI;
 
   /** Lower-case name. */
   public final String lowerName = name().toLowerCase(Locale.ROOT);

@@ -21,6 +21,7 @@ import org.apache.calcite.plan.RelOptRuleCall;
 import org.apache.calcite.plan.RelOptRuleOperand;
 import org.apache.calcite.plan.RelTraitPropagationVisitor;
 import org.apache.calcite.plan.RelTraitSet;
+import org.apache.calcite.plan.RelOptRuleOperandChildPolicy;
 import org.apache.calcite.rel.RelNode;
 
 import com.google.common.collect.ImmutableList;
@@ -30,8 +31,11 @@ import com.google.common.collect.Lists;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * <code>VolcanoRuleCall</code> implements the {@link RelOptRuleCall} interface
@@ -133,7 +137,6 @@ public class VolcanoRuleCall extends RelOptRuleCall {
             entry.getKey(), entry.getValue(), this);
       }
       volcanoPlanner.ensureRegistered(rel, rels[0], this);
-      rels[0].getCluster().invalidateMetadataQuery();
 
       if (volcanoPlanner.listener != null) {
         RelOptListener.RuleProductionEvent event =
@@ -257,6 +260,7 @@ public class VolcanoRuleCall extends RelOptRuleCall {
     assert solve > 0;
     assert solve <= rule.operands.size();
     final List<RelOptRuleOperand> operands = getRule().operands;
+
     if (solve == operands.size()) {
       // We have matched all operands. Now ask the rule whether it
       // matches; this gives the rule chance to apply side-conditions.
@@ -264,77 +268,95 @@ public class VolcanoRuleCall extends RelOptRuleCall {
       if (getRule().matches(this)) {
         onMatch();
       }
-    } else {
-      final int operandOrdinal = operand0.solveOrder[solve];
-      final int previousOperandOrdinal = operand0.solveOrder[solve - 1];
-      boolean ascending = operandOrdinal < previousOperandOrdinal;
-      final RelOptRuleOperand previousOperand =
-          operands.get(previousOperandOrdinal);
-      final RelOptRuleOperand operand = operands.get(operandOrdinal);
-      final RelNode previous = rels[previousOperandOrdinal];
+      return;
+    }
 
-      final RelOptRuleOperand parentOperand;
-      final Collection<? extends RelNode> successors;
-      if (ascending) {
-        assert previousOperand.getParent() == operand;
-        parentOperand = operand;
-        final RelSubset subset = volcanoPlanner.getSubset(previous);
-        successors = subset.getParentRels();
-      } else {
-        parentOperand = previousOperand;
-        final int parentOrdinal = operand.getParent().ordinalInRule;
-        final RelNode parentRel = rels[parentOrdinal];
-        final List<RelNode> inputs = parentRel.getInputs();
-        if (operand.ordinalInParent < inputs.size()) {
-          final RelSubset subset =
-              (RelSubset) inputs.get(operand.ordinalInParent);
-          if (operand.getMatchedClass() == RelSubset.class) {
-            successors = subset.set.subsets;
-          } else {
-            successors = subset.getRelList();
-          }
+    final int operandOrdinal = operand0.solveOrder[solve];
+    final int previousOperandOrdinal = operand0.solveOrder[solve - 1];
+    boolean ascending = operandOrdinal < previousOperandOrdinal;
+    final RelOptRuleOperand previousOperand =
+        operands.get(previousOperandOrdinal);
+    final RelOptRuleOperand operand = operands.get(operandOrdinal);
+    final RelNode previous = rels[previousOperandOrdinal];
+
+    final RelOptRuleOperand parentOperand;
+    final Collection<? extends RelNode> successors;
+    if (ascending) {
+      assert previousOperand.getParent() == operand;
+      parentOperand = operand;
+      final RelSubset subset = volcanoPlanner.getSubset(previous);
+      successors = subset.getParentRels();
+    } else {
+      parentOperand = operand.getParent();
+      final int parentOrdinal = operand.getParent().ordinalInRule;
+      final RelNode parentRel = rels[parentOrdinal];
+      final List<RelNode> inputs = parentRel.getInputs();
+      // if the child is unordered, then add all rels in all input subsets to the successors list
+      // because unordered can match child in any ordinal
+      if (parentOperand.childPolicy == RelOptRuleOperandChildPolicy.UNORDERED) {
+        if (operand.getMatchedClass() == RelSubset.class) {
+          successors = inputs;
         } else {
-          // The operand expects parentRel to have a certain number
-          // of inputs and it does not.
-          successors = ImmutableList.of();
+          successors = inputs.stream().distinct()
+              .flatMap(input -> ((RelSubset) input).getRelList().stream())
+              .distinct().collect(Collectors.toList());
         }
+      } else if (operand.ordinalInParent < inputs.size()) {
+        // child policy is not unordered
+        // we need to find the exact input node based on child operand's ordinalInParent
+        final RelSubset subset =
+            (RelSubset) inputs.get(operand.ordinalInParent);
+        if (operand.getMatchedClass() == RelSubset.class) {
+          // If the rule wants the whole subset, we just provide it
+          successors = ImmutableList.of(subset);
+        } else {
+          successors = subset.getRelList();
+        }
+      } else {
+        // The operand expects parentRel to have a certain number
+        // of inputs and it does not.
+        successors = ImmutableList.of();
+      }
+    }
+
+    for (RelNode rel : successors) {
+      if (!operand.matches(rel)) {
+        continue;
       }
 
-      for (RelNode rel : successors) {
-        if (!operand.matches(rel)) {
+      if (parentOperand.childPolicy == RelOptRuleOperandChildPolicy.UNORDERED) {
+        // Assign "childRels" if the operand is UNORDERED.
+        // Remarks:
+        // getChildRels is only valid for the case of
+        // RelOptRuleOperandChildPolicy.UNORDERED (See the comments of getChildRels).
+        // For each child in the returned child relNodes:
+        // - If it is matched in the rule, it is set to the matched RelNode (not RelSubset);
+        // - Otherwise, it is set to the corresponding RelSubset
+        if (ascending) {
+          final List<RelNode> inputs = Lists.newArrayList(rel.getInputs());
+          inputs.set(previousOperand.ordinalInParent, previous);
+          setChildRels(rel, inputs);
+        } else {
+          List<RelNode> inputs = getChildRels(previous);
+          if (inputs == null) {
+            inputs = Lists.newArrayList(previous.getInputs());
+          }
+          inputs.set(operand.ordinalInParent, rel);
+          setChildRels(previous, inputs);
+        }
+      } else if (ascending) {
+        // We know that the previous operand was *a* child of its parent,
+        // but now check that it is the *correct* child.
+        final RelSubset input =
+            (RelSubset) rel.getInput(previousOperand.ordinalInParent);
+        List<RelNode> inputRels = input.getRelList();
+        if (!inputRels.contains(previous)) {
           continue;
         }
-        if (ascending) {
-          // We know that the previous operand was *a* child of its parent,
-          // but now check that it is the *correct* child.
-          final RelSubset input =
-              (RelSubset) rel.getInput(previousOperand.ordinalInParent);
-          List<RelNode> inputRels = input.set.getRelsFromAllSubsets();
-          if (!inputRels.contains(previous)) {
-            continue;
-          }
-        }
-
-        // Assign "childRels" if the operand is UNORDERED.
-        switch (parentOperand.childPolicy) {
-        case UNORDERED:
-          if (ascending) {
-            final List<RelNode> inputs = Lists.newArrayList(rel.getInputs());
-            inputs.set(previousOperand.ordinalInParent, previous);
-            setChildRels(rel, inputs);
-          } else {
-            List<RelNode> inputs = getChildRels(previous);
-            if (inputs == null) {
-              inputs = Lists.newArrayList(previous.getInputs());
-            }
-            inputs.set(operand.ordinalInParent, rel);
-            setChildRels(previous, inputs);
-          }
-        }
-
-        rels[operandOrdinal] = rel;
-        matchRecurse(solve + 1);
       }
+
+      rels[operandOrdinal] = rel;
+      matchRecurse(solve + 1);
     }
   }
 }

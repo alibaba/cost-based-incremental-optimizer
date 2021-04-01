@@ -31,6 +31,7 @@ import org.apache.calcite.rel.core.CorrelationId;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.util.Litmus;
+import org.apache.calcite.util.Pair;
 import org.apache.calcite.util.Util;
 import org.apache.calcite.util.trace.CalciteTrace;
 
@@ -38,10 +39,12 @@ import org.slf4j.Logger;
 
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Queue;
 import java.util.Set;
 
 /**
@@ -200,7 +203,8 @@ public class RelSubset extends AbstractRelNode {
     final Set<RelNode> list = new LinkedHashSet<>();
     for (RelNode parent : set.getParentRels()) {
       for (RelSubset rel : inputSubsets(parent)) {
-        if (rel.set == set && traitSet.satisfies(rel.getTraitSet())) {
+        // see usage of this method in propagateCostImprovements0()
+        if (rel == this) {
           list.add(parent);
         }
       }
@@ -308,7 +312,7 @@ public class RelSubset extends AbstractRelNode {
 
   /**
    * Checks whether a relexp has made its subset cheaper, and if it so,
-   * recursively checks whether that subset's parents have gotten cheaper.
+   * propagate new cost to parent rel nodes using breadth first manner.
    *
    * @param planner   Planner
    * @param mq        Metadata query
@@ -317,15 +321,22 @@ public class RelSubset extends AbstractRelNode {
    */
   void propagateCostImprovements(VolcanoPlanner planner, RelMetadataQuery mq,
       RelNode rel, Set<RelSubset> activeSet) {
+    Queue<Pair<RelSubset, RelNode>> propagationQueue = new ArrayDeque<>();
     for (RelSubset subset : set.subsets) {
       if (rel.getTraitSet().satisfies(subset.traitSet)) {
-        subset.propagateCostImprovements0(planner, mq, rel, activeSet);
+        propagationQueue.offer(Pair.of(subset, rel));
       }
+    }
+
+    while (!propagationQueue.isEmpty()) {
+      Pair<RelSubset, RelNode> p = propagationQueue.poll();
+      p.left.propagateCostImprovements0(planner, mq, p.right, activeSet, propagationQueue);
     }
   }
 
   void propagateCostImprovements0(VolcanoPlanner planner, RelMetadataQuery mq,
-      RelNode rel, Set<RelSubset> activeSet) {
+      RelNode rel, Set<RelSubset> activeSet,
+      Queue<Pair<RelSubset, RelNode>> propagationQueue) {
     ++timestamp;
 
     if (!activeSet.add(this)) {
@@ -336,20 +347,28 @@ public class RelSubset extends AbstractRelNode {
       return;
     }
     try {
-      final RelOptCost cost = planner.getCost(rel, mq);
+      RelOptCost cost = planner.getCost(rel, mq);
+
+      // Update subset best cost when we find a cheaper rel or the current
+      // best's cost is changed
       if (cost.isLt(bestCost)) {
-        LOGGER.trace("Subset cost improved: subset [{}] cost was {} now {}", this, bestCost, cost);
+        LOGGER.trace("Subset cost changed: subset [{}] cost was {} now {}",
+            this, bestCost, cost);
 
         bestCost = cost;
         best = rel;
 
-        // Lower cost means lower importance. Other nodes will change
-        // too, but we'll get to them later.
+        // Recompute subset's importance and propagate cost change to parents
         planner.ruleQueue.recompute(this);
         for (RelNode parent : getParents()) {
           final RelSubset parentSubset = planner.getSubset(parent);
-          parentSubset.propagateCostImprovements(planner, mq, parent,
-              activeSet);
+
+          // parent subset will clear its cache in propagateCostImprovements0 method itself
+          for (RelSubset subset : parentSubset.set.subsets) {
+            if (parent.getTraitSet().satisfies(subset.traitSet)) {
+              propagationQueue.offer(Pair.of(subset, parent));
+            }
+          }
         }
         planner.checkForSatisfiedConverters(set, rel);
       }

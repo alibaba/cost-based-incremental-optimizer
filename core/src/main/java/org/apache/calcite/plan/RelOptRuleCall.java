@@ -154,16 +154,18 @@ public abstract class RelOptRuleCall {
    * rule.
    *
    * <p>If the policy of the operand which caused the match is not
-   * {@link org.apache.calcite.plan.RelOptRuleOperandChildPolicy#ANY},
+   * {@link org.apache.calcite.plan.RelOptRuleOperandChildPolicy#UNORDERED},
    * the children will have their
    * own operands and therefore be easily available in the array returned by
    * the {@link #getRelList()} method, so this method returns null.
    *
    * <p>This method is for
-   * {@link org.apache.calcite.plan.RelOptRuleOperandChildPolicy#ANY},
+   * {@link org.apache.calcite.plan.RelOptRuleOperandChildPolicy#UNORDERED},
    * which is generally used when a node can have a variable number of
    * children, and hence where the matched children are not retrievable by any
    * other means.
+   *
+   * <p>Warning: it produces wrong result for {@code unordered(...)} case.
    *
    * @param rel Relational expression
    * @return Children of relational expression

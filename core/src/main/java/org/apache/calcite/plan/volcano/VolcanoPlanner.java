@@ -44,7 +44,9 @@ import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.RelVisitor;
 import org.apache.calcite.rel.convert.Converter;
 import org.apache.calcite.rel.convert.ConverterRule;
+import org.apache.calcite.rel.metadata.CyclicMetadataException;
 import org.apache.calcite.rel.metadata.JaninoRelMetadataProvider;
+import org.apache.calcite.rel.metadata.RelMdUtil;
 import org.apache.calcite.rel.metadata.RelMetadataProvider;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rel.rules.AggregateJoinTransposeRule;
@@ -235,7 +237,7 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
   private final Map<List<String>, RelOptLattice> latticeByName =
       new LinkedHashMap<>();
 
-  final Map<RelNode, Provenance> provenanceMap = new HashMap<>();
+  final Map<RelNode, Provenance> provenanceMap = new HashMap<>();;
 
   private final Deque<VolcanoRuleCall> ruleCallStack = new ArrayDeque<>();
 
@@ -857,15 +859,11 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
       set = getSet(equivRel);
     }
     final RelSubset subset = registerImpl(rel, set);
-
-    if (LOGGER.isDebugEnabled()) {
-      validate();
-    }
-
     return subset;
   }
 
   public RelSubset ensureRegistered(RelNode rel, RelNode equivRel) {
+    RelSubset result;
     final RelSubset subset = getSubset(rel);
     if (subset != null) {
       if (equivRel != null) {
@@ -874,16 +872,29 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
           merge(equivSubset.set, subset.set);
         }
       }
-      return subset;
+      result = subset;
     } else {
-      return register(rel, equivRel);
+      result = register(rel, equivRel);
     }
+
+    // Checking if tree is valid considerably slows down planning
+    // Only doing it if logger level is debug or finer
+    if (LOGGER.isDebugEnabled()) {
+      assert isValid(Litmus.THROW);
+    }
+
+    return result;
   }
 
   /**
    * Checks internal consistency.
    */
-  protected void validate() {
+  protected boolean isValid(Litmus litmus) {
+    if (this.getRoot() == null) {
+      return true;
+    }
+
+    RelMetadataQuery metaQuery = this.getRoot().getCluster().getMetadataQuery();
     for (RelSet set : allSets) {
       if (set.equivalentSet != null) {
         throw new AssertionError(
@@ -896,18 +907,43 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
               "subset [" + subset.getDescription()
               + "] is in wrong set [" + set + "]");
         }
+
+        if (subset.best != null) {
+
+          // Make sure best RelNode is valid
+          if (!subset.set.rels.contains(subset.best)) {
+            return litmus.fail("RelSubset [{}] does not contain its best RelNode [{}]",
+                    subset.getDescription(), subset.best.getDescription());
+          }
+
+          // Make sure bestCost is up-to-date
+          try {
+            RelOptCost bestCost = getCost(subset.best, metaQuery);
+            if (!subset.bestCost.equals(bestCost)) {
+              return litmus.fail("RelSubset [" + subset.getDescription()
+                      + "] has wrong best cost "
+                      + subset.bestCost + ". Correct cost is " + bestCost);
+            }
+          } catch (CyclicMetadataException e) {
+            // ignore
+          }
+        }
+
         for (RelNode rel : subset.getRels()) {
-          RelOptCost relCost = getCost(rel, rel.getCluster().getMetadataQuery());
-          if (relCost.isLt(subset.bestCost)) {
-            throw new AssertionError(
-                "rel [" + rel.getDescription()
-                + "] has lower cost " + relCost
-                + " than best cost " + subset.bestCost
-                + " of subset [" + subset.getDescription() + "]");
+          try {
+            RelOptCost relCost = getCost(rel, metaQuery);
+            if (relCost.isLt(subset.bestCost)) {
+              return litmus.fail("rel [{}] has lower cost {} than "
+                      + "best cost {} of subset [{}]",
+                      rel.getDescription(), relCost, subset.bestCost, subset.getDescription());
+            }
+          } catch (CyclicMetadataException e) {
+            // ignore
           }
         }
       }
     }
+    return litmus.succeed();
   }
 
   public void registerAbstractRelationalRules() {
@@ -1268,6 +1304,18 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
         boolean existed = subset.set.rels.remove(rel);
         assert existed : "rel was not known to its set";
         final RelSubset equivSubset = getSubset(equivRel);
+        for (RelSubset s : subset.set.subsets) {
+          if (s.best == rel) {
+            Set<RelSubset> activeSet = new HashSet<>();
+            s.best = equivRel;
+
+            // Propagate cost improvement since this potentially would change the subset's best cost
+            s.propagateCostImprovements(
+                    this, equivRel.getCluster().getMetadataQuery(),
+                    equivRel, activeSet);
+          }
+        }
+
         if (equivSubset != subset) {
           // The equivalent relational expression is in a different
           // subset, therefore the sets are equivalent.
@@ -1640,7 +1688,11 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
     // not established. So, give the subset another change to figure out
     // its cost.
     final RelMetadataQuery mq = rel.getCluster().getMetadataQuery();
-    subset.propagateCostImprovements(this, mq, rel, new HashSet<RelSubset>());
+    try {
+      subset.propagateCostImprovements(this, mq, rel, new HashSet<>());
+    } catch (CyclicMetadataException e) {
+      // ignore
+    }
 
     return subset;
   }
