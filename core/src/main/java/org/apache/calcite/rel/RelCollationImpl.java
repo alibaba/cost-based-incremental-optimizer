@@ -50,7 +50,7 @@ public class RelCollationImpl implements RelCollation {
 
   //~ Constructors -----------------------------------------------------------
 
-  protected RelCollationImpl(ImmutableList<RelFieldCollation> fieldCollations) {
+  public RelCollationImpl(ImmutableList<RelFieldCollation> fieldCollations) {
     this.fieldCollations = fieldCollations;
     Preconditions.checkArgument(
         Util.isDistinct(RelCollations.ordinals(fieldCollations)),

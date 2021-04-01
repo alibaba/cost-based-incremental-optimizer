@@ -133,8 +133,15 @@ public class RelMdDistribution
   /** Helper method to determine a
    * {@link org.apache.calcite.rel.core.Calc}'s distribution. */
   public static RelDistribution calc(RelMetadataQuery mq, RelNode input,
-      RexProgram program) {
-    throw new AssertionError(); // TODO:
+                                     RexProgram program) {
+    assert program.getCondition() != null || !program.getProjectList().isEmpty();
+    final RelDistribution inputDistribution = mq.distribution(input);
+    if (!program.getProjectList().isEmpty()) {
+      final Mappings.TargetMapping mapping = program.getPartialMapping(
+              input.getRowType().getFieldCount());
+      return inputDistribution.apply(mapping);
+    }
+    return inputDistribution;
   }
 
   /** Helper method to determine a {@link Project}'s collation. */

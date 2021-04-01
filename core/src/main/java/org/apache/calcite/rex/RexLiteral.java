@@ -206,7 +206,7 @@ public class RexLiteral extends RexNode {
   /**
    * Creates a <code>RexLiteral</code>.
    */
-  RexLiteral(
+  public RexLiteral(
       Comparable value,
       RelDataType type,
       SqlTypeName typeName) {

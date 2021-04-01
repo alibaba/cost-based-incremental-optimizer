@@ -160,6 +160,13 @@ public class JavaTypeFactoryImpl
     }
   }
 
+  @Override public RelDataType leastRestrictive(List<RelDataType> types) {
+    assert types != null;
+    assert types.size() >= 1;
+
+    return super.leastRestrictiveByCast(types);
+  }
+
   public Type getJavaClass(RelDataType type) {
     if (type instanceof JavaType) {
       JavaType javaType = (JavaType) type;

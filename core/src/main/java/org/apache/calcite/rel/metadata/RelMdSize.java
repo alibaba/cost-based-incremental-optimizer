@@ -17,6 +17,7 @@
 package org.apache.calcite.rel.metadata;
 
 import org.apache.calcite.avatica.util.ByteString;
+import org.apache.calcite.plan.volcano.RelSubset;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.Aggregate;
 import org.apache.calcite.rel.core.AggregateCall;
@@ -37,6 +38,7 @@ import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexInputRef;
 import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.sql.type.MapSqlType;
 import org.apache.calcite.util.BuiltInMethod;
 import org.apache.calcite.util.ImmutableNullableList;
 import org.apache.calcite.util.NlsString;
@@ -101,6 +103,28 @@ public class RelMdSize implements MetadataHandler<BuiltInMetadata.Size> {
     return d;
   }
 
+  public List<Double> averageColumnSizes(RelSubset rel,
+                                         RelMetadataQuery mq) {
+    RelNode chooseRel = rel.getBest() != null ?
+            rel.getBest() : rel.getOriginal();
+
+    assert chooseRel != null;
+    try {
+      return mq.getAverageColumnSizes(chooseRel);
+    } catch (CyclicMetadataException e) {
+      return defaultAverageRowSize(chooseRel);
+    }
+  }
+
+  public List<Double> defaultAverageRowSize(RelNode rel) {
+    final List<RelDataTypeField> fields = rel.getRowType().getFieldList();
+    final ImmutableList.Builder<Double> list = ImmutableList.builder();
+    for (RelDataTypeField field : fields) {
+      list.add(averageTypeValueSize(field.getType()));
+    }
+    return list.build();
+  }
+
   /** Catch-all implementation for
    * {@link BuiltInMetadata.Size#averageColumnSizes()},
    * invoked using reflection.
@@ -108,7 +132,7 @@ public class RelMdSize implements MetadataHandler<BuiltInMetadata.Size> {
    * @see org.apache.calcite.rel.metadata.RelMetadataQuery#getAverageColumnSizes
    */
   public List<Double> averageColumnSizes(RelNode rel, RelMetadataQuery mq) {
-    return null; // absolutely no idea
+    return defaultAverageRowSize(rel); // estimate a default value
   }
 
   public List<Double> averageColumnSizes(Filter rel, RelMetadataQuery mq) {
@@ -317,6 +341,14 @@ public class RelMdSize implements MetadataHandler<BuiltInMetadata.Size> {
         average += averageTypeValueSize(field.getType());
       }
       return average;
+    case ARRAY:
+      // Assume 10 elements average in complex types.
+      return type.getComponentType() != null ? 10 * averageTypeValueSize(type.getComponentType()):100d;
+    case MAP:
+      MapSqlType map = (MapSqlType) type;
+      return 10 // Assume 10 elements average in complex types.
+              * (averageTypeValueSize(map.getKeyType())
+              + averageTypeValueSize(map.getValueType()));
     default:
       return null;
     }

@@ -249,10 +249,7 @@ public abstract class AbstractRelOptPlanner implements RelOptPlanner {
   }
 
   public void addListener(RelOptListener newListener) {
-    if (listener == null) {
-      listener = new MulticastRelOptListener();
-    }
-    listener.addListener(newListener);
+    this.getListener().addListener(newListener);
   }
 
   public void registerMetadataProviders(List<RelMetadataProvider> list) {
@@ -409,6 +406,9 @@ public abstract class AbstractRelOptPlanner implements RelOptPlanner {
   }
 
   protected MulticastRelOptListener getListener() {
+    if (listener == null) {
+      listener = new MulticastRelOptListener();
+    }
     return listener;
   }
 

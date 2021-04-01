@@ -29,8 +29,8 @@ import java.util.function.Predicate;
  * Rule to convert a {@link org.apache.calcite.rel.logical.LogicalFilter} to an
  * {@link EnumerableFilter}.
  */
-class EnumerableFilterRule extends ConverterRule {
-  EnumerableFilterRule() {
+public class EnumerableFilterRule extends ConverterRule {
+  public EnumerableFilterRule() {
     super(LogicalFilter.class,
         (Predicate<LogicalFilter>) RelOptUtil::containsMultisetOrWindowedAgg,
         Convention.NONE, EnumerableConvention.INSTANCE,

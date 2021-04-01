@@ -223,16 +223,20 @@ public class ReflectiveSchema
   }
 
   /** Table that is implemented by reading from a Java object. */
-  private static class ReflectiveTable
+  public static class ReflectiveTable
       extends AbstractQueryableTable
       implements Table, ScannableTable {
-    private final Type elementType;
+    public final Type elementType;
     private final Enumerable enumerable;
 
     ReflectiveTable(Type elementType, Enumerable enumerable) {
       super(elementType);
       this.elementType = elementType;
       this.enumerable = enumerable;
+    }
+
+    public Enumerable getEnumerable() {
+      return this.enumerable;
     }
 
     public RelDataType getRowType(RelDataTypeFactory typeFactory) {
@@ -361,7 +365,7 @@ public class ReflectiveSchema
   /** Table based on a Java field.
    *
    * @param <T> element type */
-  private static class FieldTable<T> extends ReflectiveTable {
+  public static class FieldTable<T> extends ReflectiveTable {
     private final Field field;
     private Statistic statistic;
 
@@ -369,7 +373,7 @@ public class ReflectiveSchema
       this(field, elementType, enumerable, Statistics.UNKNOWN);
     }
 
-    FieldTable(Field field, Type elementType, Enumerable<T> enumerable,
+    public FieldTable(Field field, Type elementType, Enumerable<T> enumerable,
         Statistic statistic) {
       super(elementType, enumerable);
       this.field = field;
@@ -378,6 +382,10 @@ public class ReflectiveSchema
 
     public String toString() {
       return "Relation {field=" + field.getName() + "}";
+    }
+
+    public Field getField() {
+      return this.field;
     }
 
     @Override public Statistic getStatistic() {
@@ -393,10 +401,10 @@ public class ReflectiveSchema
   }
 
   /** Function that returns an array of a given object's field values. */
-  private static class FieldSelector implements Function1<Object, Object[]> {
+  public static class FieldSelector implements Function1<Object, Object[]> {
     private final Field[] fields;
 
-    FieldSelector(Class elementType) {
+    public FieldSelector(Class elementType) {
       this.fields = elementType.getFields();
     }
 

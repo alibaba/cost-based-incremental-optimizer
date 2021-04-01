@@ -52,7 +52,7 @@ public class RexCall extends RexNode {
 
   //~ Constructors -----------------------------------------------------------
 
-  protected RexCall(
+  public RexCall(
       RelDataType type,
       SqlOperator op,
       List<? extends RexNode> operands) {

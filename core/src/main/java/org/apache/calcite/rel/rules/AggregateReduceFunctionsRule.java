@@ -101,6 +101,9 @@ public class AggregateReduceFunctionsRule extends RelOptRule {
       return false;
     }
     Aggregate oldAggRel = (Aggregate) call.rels[0];
+    if (oldAggRel.getAggCallList().stream().anyMatch(c -> c.name != null && (c.name.contains("__row_count") || c.name.contains("__tvr")))) {
+      return false;
+    }
     return containsAvgStddevVarCall(oldAggRel.getAggCallList());
   }
 
@@ -132,7 +135,7 @@ public class AggregateReduceFunctionsRule extends RelOptRule {
     }
     switch (kind) {
     case SUM:
-      return true;
+      return false;
     }
     return false;
   }

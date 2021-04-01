@@ -26,6 +26,7 @@ import org.apache.calcite.rel.metadata.RelMdUtil;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.sql.SemiJoinType;
 import org.apache.calcite.sql.validate.SqlValidatorUtil;
 import org.apache.calcite.util.ImmutableIntList;
 import org.apache.calcite.util.Util;
@@ -42,6 +43,9 @@ import com.google.common.collect.ImmutableSet;
  */
 public class SemiJoin extends EquiJoin {
   //~ Constructors -----------------------------------------------------------
+
+  private SemiJoinType semiJoinType = SemiJoinType.LEFT;
+
 
   /**
    * Creates a SemiJoin.
@@ -76,6 +80,28 @@ public class SemiJoin extends EquiJoin {
         JoinRelType.INNER);
   }
 
+  public SemiJoin(
+          RelOptCluster cluster,
+          RelTraitSet traitSet,
+          RelNode left,
+          RelNode right,
+          RexNode condition,
+          ImmutableIntList leftKeys,
+          ImmutableIntList rightKeys,
+          SemiJoinType semiJoinType) {
+    super(
+            cluster,
+            traitSet,
+            left,
+            right,
+            condition,
+            leftKeys,
+            rightKeys,
+            ImmutableSet.of(),
+            JoinRelType.INNER);
+    this.semiJoinType = semiJoinType;
+  }
+
   /** Creates a SemiJoin. */
   public static SemiJoin create(RelNode left, RelNode right, RexNode condition,
       ImmutableIntList leftKeys, ImmutableIntList rightKeys) {
@@ -83,6 +109,15 @@ public class SemiJoin extends EquiJoin {
     return new SemiJoin(cluster, cluster.traitSetOf(Convention.NONE), left,
         right, condition, leftKeys, rightKeys);
   }
+
+  /** Creates a SemiJoin. */
+  public static SemiJoin create(RelNode left, RelNode right, RexNode condition,
+                                ImmutableIntList leftKeys, ImmutableIntList rightKeys, SemiJoinType semiJoinType) {
+    final RelOptCluster cluster = left.getCluster();
+    return new SemiJoin(cluster, cluster.traitSetOf(Convention.NONE), left,
+            right, condition, leftKeys, rightKeys, semiJoinType);
+  }
+
 
   //~ Methods ----------------------------------------------------------------
 
@@ -92,7 +127,7 @@ public class SemiJoin extends EquiJoin {
     final JoinInfo joinInfo = JoinInfo.of(left, right, condition);
     assert joinInfo.isEqui();
     return new SemiJoin(getCluster(), traitSet, left, right, condition,
-        joinInfo.leftKeys, joinInfo.rightKeys);
+        joinInfo.leftKeys, joinInfo.rightKeys, this.semiJoinType);
   }
 
   @Override public RelOptCost computeSelfCost(RelOptPlanner planner,

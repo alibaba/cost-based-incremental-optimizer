@@ -19,21 +19,22 @@ package org.apache.calcite.tools;
 import org.apache.calcite.adapter.enumerable.EnumerableRules;
 import org.apache.calcite.config.CalciteConnectionConfig;
 import org.apache.calcite.interpreter.NoneToBindableConverterRule;
-import org.apache.calcite.plan.RelOptCostImpl;
-import org.apache.calcite.plan.RelOptLattice;
-import org.apache.calcite.plan.RelOptMaterialization;
-import org.apache.calcite.plan.RelOptPlanner;
-import org.apache.calcite.plan.RelOptRule;
-import org.apache.calcite.plan.RelOptUtil;
-import org.apache.calcite.plan.RelTraitSet;
+import org.apache.calcite.plan.*;
 import org.apache.calcite.plan.hep.HepMatchOrder;
 import org.apache.calcite.plan.hep.HepPlanner;
 import org.apache.calcite.plan.hep.HepProgram;
 import org.apache.calcite.plan.hep.HepProgramBuilder;
+import org.apache.calcite.plan.tvr.TvrSemantics;
+import org.apache.calcite.plan.tvr.TvrSetSnapshot;
+import org.apache.calcite.plan.tvr.TvrVersion;
+import org.apache.calcite.plan.volcano.RelSubset;
+import org.apache.calcite.plan.volcano.TvrMetaSetType;
 import org.apache.calcite.prepare.CalcitePrepareImpl;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.core.AdhocSink;
 import org.apache.calcite.rel.core.Calc;
 import org.apache.calcite.rel.core.RelFactories;
+import org.apache.calcite.rel.core.TableSink;
 import org.apache.calcite.rel.metadata.ChainedRelMetadataProvider;
 import org.apache.calcite.rel.metadata.DefaultRelMetadataProvider;
 import org.apache.calcite.rel.metadata.RelMetadataProvider;
@@ -60,6 +61,12 @@ import org.apache.calcite.rel.rules.SemiJoinRule;
 import org.apache.calcite.rel.rules.SortProjectTransposeRule;
 import org.apache.calcite.rel.rules.SubQueryRemoveRule;
 import org.apache.calcite.rel.rules.TableScanRule;
+import org.apache.calcite.rel.tvr.TvrVolcanoPlanner;
+import org.apache.calcite.rel.tvr.rels.EnumerablePhysicalVirtualRoot;
+import org.apache.calcite.rel.tvr.rels.LogicalAdhocSink;
+import org.apache.calcite.rel.tvr.rels.LogicalVirtualRoot;
+import org.apache.calcite.rel.tvr.utils.TvrContext;
+import org.apache.calcite.rel.tvr.utils.TvrUtils;
 import org.apache.calcite.sql2rel.RelDecorrelator;
 import org.apache.calcite.sql2rel.RelFieldTrimmer;
 import org.apache.calcite.sql2rel.SqlToRelConverter;
@@ -70,7 +77,9 @@ import com.google.common.collect.Lists;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
+import java.util.stream.Collectors;
 
 /**
  * Utilities for creating {@link Program}s.
@@ -309,6 +318,90 @@ public class Programs {
         // that EnumerableCalcRel is introduced.
         calc(metadataProvider));
   }
+
+  public static class TvrRuleSetProgram implements Program {
+
+    final RuleSet ruleSet;
+
+    public TvrRuleSetProgram(RuleSet ruleSet) {
+      this.ruleSet = ruleSet;
+    }
+
+    @Override
+    public RelNode run(RelOptPlanner planner, RelNode root, RelTraitSet requiredOutputTraits, List<RelOptMaterialization> materializations, List<RelOptLattice> lattices) {
+      planner.clear();
+      for (RelOptRule rule : ruleSet) {
+        planner.addRule(rule);
+      }
+      TvrVolcanoPlanner tvrVolcanoPlanner = (TvrVolcanoPlanner) planner;
+
+      if (! (root instanceof AdhocSink || root instanceof TableSink)) {
+        root = LogicalAdhocSink.create(root);
+      }
+
+      TvrContext ctx = TvrContext.getInstance(root.getCluster());
+      ctx.registerTables(root);
+      TvrMetaSetType tvrType = ctx.getDefaultTvrType();
+      root = tvrVolcanoPlanner.getOrCreateSetFromTvrSet(root, tvrType, TvrSemantics.SET_SNAPSHOT_MAX,
+              root.getRowType(), root.getTraitSet());
+
+      if (TvrUtils.progressiveRequireOutputView(ctx)) {
+        assert !TvrUtils.progressiveVirtualTablesinkEnabled(ctx);
+        root = addRequireOutputView(planner, root);
+      }
+
+      if (!root.getTraitSet().equals(requiredOutputTraits)) {
+        root = planner.changeTraits(root, requiredOutputTraits);
+      }
+      planner.setRoot(root);
+      return planner.findBestExp();
+    }
+
+    public RelNode addRequireOutputView(RelOptPlanner planner, RelNode root) {
+      TvrContext ctx = TvrContext.getInstance(root.getCluster());
+      if (! TvrUtils.progressiveRequireOutputView(ctx)) {
+        return root;
+      }
+
+      if (root instanceof RelSubset) {
+        root = ((RelSubset) root).getOriginal();
+      }
+      List<RelNode> sinks = Collections.singletonList(root);
+      List<RelNode> newSinks = new ArrayList<>(sinks);
+      List<RelNode> earlyOutputViews = new ArrayList<>();
+
+      TvrVersion[] snapshots = ctx.getDefaultTvrType().getSnapshots();
+      List<TvrVersion> earlySnapshots = Arrays.stream(snapshots)
+              .limit(snapshots.length - 1).collect(Collectors.toList());
+
+      TvrVolcanoPlanner volcanoPlanner = (TvrVolcanoPlanner) planner;
+
+      for (RelNode sink : sinks) {
+        RelNode sinkInput = sink.getInput(0);
+
+        for (TvrVersion earlySnapshot : earlySnapshots) {
+          RelNode sinkInputEarlySnapshot = volcanoPlanner
+                  .getOrCreateSetForTvr(root.getCluster(),
+                          volcanoPlanner.getSet(sinkInput).getTvrForTvrSet(ctx.getDefaultTvrType()),
+                          new TvrSetSnapshot(earlySnapshot), sinkInput.getRowType(), sinkInput.getTraitSet());
+
+          RelNode newSink = sink.copy(sink.getTraitSet(), ImmutableList.of(sinkInputEarlySnapshot));
+          earlyOutputViews.add(newSink);
+        }
+
+      }
+
+      newSinks.addAll(earlyOutputViews);
+
+      boolean logical = root.getConvention() == Convention.NONE;
+      if (logical) {
+        return LogicalVirtualRoot.create(newSinks);
+      } else {
+        return EnumerablePhysicalVirtualRoot.create(newSinks);
+      }
+    }
+  }
+
 
   /** Program backed by a {@link RuleSet}. */
   static class RuleSetProgram implements Program {

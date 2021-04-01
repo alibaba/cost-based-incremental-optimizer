@@ -3323,6 +3323,161 @@ public abstract class EnumerableDefaults {
     public void close() {
     }
   }
+
+  private static final Object DUMMY = new Object();
+
+
+  /**
+   * Print a message to the console before passing the input to the output.
+   * For demonstration purposes only.
+   */
+  @SuppressWarnings("unchecked")
+  public static <TSource> Enumerable<TSource> tvrPrintMessage(
+          Enumerable<TSource> input,
+          String startMessage){
+
+    return new AbstractEnumerable<TSource>() {
+      @Override public Enumerator<TSource> enumerator() {
+        return new Enumerator<TSource>() {
+
+          private final Enumerator<TSource> inputEnumerator = input.enumerator();
+          private boolean started = false;
+
+          @Override public TSource current() {
+            if (!started) {
+              System.out.println(startMessage);
+              started = true;
+            }
+            return inputEnumerator.current();
+          }
+
+          @Override public boolean moveNext() {
+            boolean moveNext = inputEnumerator.moveNext();
+            if (! moveNext && !started) {
+              System.out.println(startMessage);
+              System.out.println("no result");
+            }
+            return moveNext;
+          }
+
+          @Override public void reset() {
+            inputEnumerator.reset();
+          }
+
+          @Override public void close() {
+            inputEnumerator.close();
+          }
+        };
+      }
+    };
+  }
+
+
+  /**
+   * Lazy read and lazy write spool that stores data into a collection
+   */
+  @SuppressWarnings("unchecked")
+  public static <TSource> Enumerable<TSource> tvrPhysicalTableSink(
+          Collection<TSource> outputCollection,
+          Enumerable<TSource> input) {
+
+    return new AbstractEnumerable<TSource>() {
+      @Override public Enumerator<TSource> enumerator() {
+        return new Enumerator<TSource>() {
+          private TSource current = (TSource) DUMMY;
+          private final Enumerator<TSource> inputEnumerator = input.enumerator();
+          private final Collection<TSource> collection = outputCollection;
+          private final Collection<TSource> tempCollection = new ArrayList<>();
+
+          @Override public TSource current() {
+            if (this.current == DUMMY) {
+              throw new NoSuchElementException();
+            }
+            return this.current;
+          }
+
+          @Override public boolean moveNext() {
+            while (this.inputEnumerator.moveNext()) {
+              this.current = this.inputEnumerator.current();
+              this.tempCollection.add(this.current);
+            }
+            this.flush();
+            return false;
+          }
+
+          private void flush() {
+            this.collection.clear();
+            this.collection.addAll(this.tempCollection);
+            this.tempCollection.clear();
+          }
+
+          @Override public void reset() {
+            this.inputEnumerator.reset();
+            this.collection.clear();
+            this.tempCollection.clear();
+          }
+
+          @Override public void close() {
+            this.inputEnumerator.close();
+          }
+        };
+      }
+    };
+  }
+
+  /**
+   * Lazy read and lazy write spool that stores data into a collection
+   */
+  @SuppressWarnings("unchecked")
+  public static <TSource> Enumerable<TSource> tvrPhysicalTableSpool(
+          Collection<TSource> outputCollection,
+          Enumerable<TSource> input) {
+
+    return new AbstractEnumerable<TSource>() {
+      @Override public Enumerator<TSource> enumerator() {
+        return new Enumerator<TSource>() {
+          private TSource current = (TSource) DUMMY;
+          private final Enumerator<TSource> inputEnumerator = input.enumerator();
+          private final Collection<TSource> collection = outputCollection;
+          private final Collection<TSource> tempCollection = new ArrayList<>();
+
+          @Override public TSource current() {
+            if (this.current == DUMMY) {
+              throw new NoSuchElementException();
+            }
+            return this.current;
+          }
+
+          @Override public boolean moveNext() {
+            if (this.inputEnumerator.moveNext()) {
+              this.current = this.inputEnumerator.current();
+              this.tempCollection.add(this.current);
+              return true;
+            }
+            this.flush();
+            return false;
+          }
+
+          private void flush() {
+            this.collection.clear();
+            this.collection.addAll(this.tempCollection);
+            this.tempCollection.clear();
+          }
+
+          @Override public void reset() {
+            this.inputEnumerator.reset();
+            this.collection.clear();
+            this.tempCollection.clear();
+          }
+
+          @Override public void close() {
+            this.inputEnumerator.close();
+          }
+        };
+      }
+    };
+  }
+
 }
 
 // End EnumerableDefaults.java

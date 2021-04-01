@@ -160,7 +160,7 @@ public class SqlTypeFactoryImpl extends RelDataTypeFactoryImpl {
     return super.leastRestrictive(types);
   }
 
-  private RelDataType leastRestrictiveByCast(List<RelDataType> types) {
+  public RelDataType leastRestrictiveByCast(List<RelDataType> types) {
     RelDataType resultType = types.get(0);
     boolean anyNullable = resultType.isNullable();
     for (int i = 1; i < types.size(); i++) {

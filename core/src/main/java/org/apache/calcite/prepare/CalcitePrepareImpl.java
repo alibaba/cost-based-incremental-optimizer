@@ -50,23 +50,12 @@ import org.apache.calcite.linq4j.tree.MethodCallExpression;
 import org.apache.calcite.linq4j.tree.NewExpression;
 import org.apache.calcite.linq4j.tree.ParameterExpression;
 import org.apache.calcite.materialize.MaterializationService;
-import org.apache.calcite.plan.Contexts;
-import org.apache.calcite.plan.Convention;
-import org.apache.calcite.plan.ConventionTraitDef;
-import org.apache.calcite.plan.RelOptCluster;
-import org.apache.calcite.plan.RelOptCostFactory;
-import org.apache.calcite.plan.RelOptPlanner;
-import org.apache.calcite.plan.RelOptRule;
-import org.apache.calcite.plan.RelOptTable;
-import org.apache.calcite.plan.RelOptUtil;
+import org.apache.calcite.plan.*;
 import org.apache.calcite.plan.hep.HepPlanner;
 import org.apache.calcite.plan.hep.HepProgramBuilder;
+import org.apache.calcite.plan.volcano.TvrVolcanoCost;
 import org.apache.calcite.plan.volcano.VolcanoPlanner;
-import org.apache.calcite.rel.RelCollation;
-import org.apache.calcite.rel.RelCollationTraitDef;
-import org.apache.calcite.rel.RelCollations;
-import org.apache.calcite.rel.RelNode;
-import org.apache.calcite.rel.RelRoot;
+import org.apache.calcite.rel.*;
 import org.apache.calcite.rel.core.Filter;
 import org.apache.calcite.rel.core.Project;
 import org.apache.calcite.rel.core.Sort;
@@ -97,6 +86,10 @@ import org.apache.calcite.rel.rules.SortUnionTransposeRule;
 import org.apache.calcite.rel.rules.TableScanRule;
 import org.apache.calcite.rel.rules.ValuesReduceRule;
 import org.apache.calcite.rel.stream.StreamRules;
+import org.apache.calcite.rel.tvr.TvrVolcanoPlanner;
+import org.apache.calcite.rel.tvr.rules.TvrRuleCollection;
+import org.apache.calcite.rel.tvr.utils.TvrContext;
+import org.apache.calcite.rel.tvr.utils.TvrUtils;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.rel.type.RelDataTypeField;
@@ -145,13 +138,7 @@ import java.lang.reflect.Type;
 import java.math.BigDecimal;
 import java.sql.DatabaseMetaData;
 import java.sql.Types;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 
 import static org.apache.calcite.util.Static.RESOURCE;
 
@@ -180,10 +167,14 @@ public class CalcitePrepareImpl implements CalcitePrepare {
   public final boolean enableBindable = Hook.ENABLE_BINDABLE.get(false);
 
   /** Whether the enumerable convention is enabled. */
-  public static final boolean ENABLE_ENUMERABLE = true;
+  public static final boolean ENABLE_ENUMERABLE () {
+    return Util.getBooleanProperty("calcite.enable.enumerable", true);
+  }
 
   /** Whether the streaming is enabled. */
   public static final boolean ENABLE_STREAM = true;
+
+
 
   private static final Set<String> SIMPLE_SQLS =
       ImmutableSet.of(
@@ -216,7 +207,7 @@ public class CalcitePrepareImpl implements CalcitePrepare {
           EnumerableRules.ENUMERABLE_TABLE_SCAN_RULE,
           EnumerableRules.ENUMERABLE_TABLE_FUNCTION_SCAN_RULE);
 
-  private static final List<RelOptRule> DEFAULT_RULES =
+  public static final List<RelOptRule> DEFAULT_RULES =
       ImmutableList.of(
           AggregateStarTableRule.INSTANCE,
           AggregateStarTableRule.INSTANCE2,
@@ -515,9 +506,41 @@ public class CalcitePrepareImpl implements CalcitePrepare {
       final CalcitePrepare.Context prepareContext,
       org.apache.calcite.plan.Context externalContext,
       RelOptCostFactory costFactory) {
+
+    Properties configProperties = prepareContext.config().getProperties();
+    boolean enableTvr = Boolean.parseBoolean(configProperties.getProperty(TvrUtils.PROGRESSIVE_ENABLE, "false"));
+
+    TvrContext tvrContext = null;
+    if (externalContext != null) {
+      tvrContext = externalContext.unwrap(TvrContext.class);
+    }
+    if (tvrContext != null) {
+      enableTvr = enableTvr || tvrContext.getConfig().getBool(TvrUtils.PROGRESSIVE_ENABLE, false);
+    }
+
+    if (enableTvr) {
+      if (tvrContext == null) {
+        tvrContext = new TvrContext();
+        for (String name: configProperties.stringPropertyNames()) {
+          if (name.toLowerCase().contains("tvr") || name.toLowerCase().contains("progressive")) {
+            tvrContext.getConfig().set(name, configProperties.getProperty(name));
+          }
+        }
+        externalContext = Contexts.chain(externalContext, Contexts.of(tvrContext));
+      }
+      org.apache.calcite.plan.Context context = Contexts.chain(externalContext, Contexts.of(prepareContext.config()));
+
+      TvrVolcanoPlanner planner = new TvrVolcanoPlanner(TvrVolcanoCost.FACTORY, context);
+      planner.addRelTraitDef(ConventionTraitDef.INSTANCE);
+
+      TvrRuleCollection.tvrStandardRuleSet().forEach(planner::addRule);
+      return planner;
+    }
+
     if (externalContext == null) {
       externalContext = Contexts.of(prepareContext.config());
     }
+
     final VolcanoPlanner planner =
         new VolcanoPlanner(costFactory, externalContext);
     planner.addRelTraitDef(ConventionTraitDef.INSTANCE);
@@ -547,14 +570,14 @@ public class CalcitePrepareImpl implements CalcitePrepare {
     planner.addRule(ProjectTableScanRule.INSTANCE);
     planner.addRule(ProjectTableScanRule.INTERPRETER);
 
-    if (ENABLE_ENUMERABLE) {
+    if (ENABLE_ENUMERABLE()) {
       for (RelOptRule rule : ENUMERABLE_RULES) {
         planner.addRule(rule);
       }
       planner.addRule(EnumerableInterpreterRule.INSTANCE);
     }
 
-    if (enableBindable && ENABLE_ENUMERABLE) {
+    if (enableBindable && ENABLE_ENUMERABLE()) {
       planner.addRule(
           EnumerableBindable.EnumerableToBindableConverterRule.INSTANCE);
     }

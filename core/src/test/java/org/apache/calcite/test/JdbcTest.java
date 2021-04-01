@@ -3468,7 +3468,7 @@ public class JdbcTest {
             "empid=110; name=Theodore");
   }
 
-  /** Tests that SUM and AVG over empty set return null. COUNT returns 0. */
+  /** Tests that SUM and AVG over empty set return null. H returns 0. */
   @Test public void testAggregateEmpty() {
     CalciteAssert.hr()
         .query("select\n"

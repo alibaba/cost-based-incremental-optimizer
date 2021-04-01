@@ -16,6 +16,7 @@
  */
 package org.apache.calcite.rel.metadata;
 
+import com.google.common.collect.HashMultimap;
 import org.apache.calcite.plan.hep.HepRelVertex;
 import org.apache.calcite.plan.volcano.RelSubset;
 import org.apache.calcite.rel.RelNode;
@@ -71,6 +72,9 @@ public class RelMdNodeTypes
 
   public Multimap<Class<? extends RelNode>, RelNode> getNodeTypes(RelSubset rel,
       RelMetadataQuery mq) {
+    if (rel.getBest() == null && rel.getOriginal() == null) {
+      return HashMultimap.create();
+    }
     return mq.getNodeTypes(Util.first(rel.getBest(), rel.getOriginal()));
   }
 

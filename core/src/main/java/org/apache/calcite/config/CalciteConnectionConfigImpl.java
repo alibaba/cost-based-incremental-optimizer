@@ -40,6 +40,10 @@ public class CalciteConnectionConfigImpl extends ConnectionConfigImpl
     super(properties);
   }
 
+  public Properties getProperties() {
+    return this.properties;
+  }
+
   /** Returns a copy of this configuration with one property changed. */
   public CalciteConnectionConfigImpl set(CalciteConnectionProperty property,
       String value) {
