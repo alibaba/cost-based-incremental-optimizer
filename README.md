@@ -1,25 +1,13 @@
-<!--
-{% comment %}
-Licensed to the Apache Software Foundation (ASF) under one or more
-contributor license agreements.  See the NOTICE file distributed with
-this work for additional information regarding copyright ownership.
-The ASF licenses this file to you under the Apache License, Version 2.0
-(the "License"); you may not use this file except in compliance with
-the License.  You may obtain a copy of the License at
 
-http://www.apache.org/licenses/LICENSE-2.0
+# Tempura: A General Cost-Based Optimizer Framework for Incremental Data Processing
 
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-{% endcomment %}
--->
-[![Build Status](https://travis-ci.org/julianhyde/calcite.svg?branch=master)](https://travis-ci.org/julianhyde/calcite)
+Tempura is built on top of [Apache Calcite](https://github.com/apache/calcite). For details see our research [paper](http://www.vldb.org/pvldb/vol14/p14-wang.pdf) published in VLDB'20.
 
-# Apache Calcite
+To demonstrate how Tempura works, we have added the following example programs that can be run directly:
 
-Apache Calcite is a dynamic data management framework.
-
-For more details, see the [home page](http://calcite.apache.org).
+ - `TvrOptimizationTest.java` runs the Tempura optimizer.
+    This program produces a progressive physical plan by the Tempura optimizer that runs across several time points.
+    The physical plan is printed out to the console in DOT format, which can be viewed using an online graphviz tool.
+ - `TvrExecutionTest.java` uses the Tempura optimizer in an end-to-end query.
+     This program generates a progressive physical plan and then uses Calcite's built-in executor to run the plan.
+     The output at each time point is printed to the console.
