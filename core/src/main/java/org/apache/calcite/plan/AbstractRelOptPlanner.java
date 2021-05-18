@@ -56,7 +56,7 @@ public abstract class AbstractRelOptPlanner implements RelOptPlanner {
 
   protected final RelOptCostFactory costFactory;
 
-  private MulticastRelOptListener listener;
+  public MulticastRelOptListener listener;
 
   private Pattern ruleDescExclusionFilter;
 

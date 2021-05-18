@@ -250,11 +250,6 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
   private int registerCount;
 
   /**
-   * Listener for this planner, or null if none set.
-   */
-  RelOptListener listener;
-
-  /**
    * Dump of the root relational expression, as it was before any rules were
    * applied. For debugging.
    */
@@ -2077,16 +2072,6 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
       registerCount++;
     }
     return subset;
-  }
-
-  // implement RelOptPlanner
-  public void addListener(RelOptListener newListener) {
-    // TODO jvs 6-Apr-2006:  new superclass AbstractRelOptPlanner
-    // now defines a multicast listener; just need to hook it in
-    if (listener != null) {
-      throw Util.needToImplement("multiple VolcanoPlanner listeners");
-    }
-    listener = newListener;
   }
 
   // implement RelOptPlanner
