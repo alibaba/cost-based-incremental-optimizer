@@ -55,7 +55,7 @@ public class VolcanoRuleCall extends RelOptRuleCall {
 
   /**
    * Rule match template for a {@link RelOptRuleOperand} in a solve order of a
-   * {@link RelOptRule}. The OperandMatch is compiled once at the time of
+   * {@link }. The OperandMatch is compiled once at the time of
    * assigning solve order, with all possible predicates and pruning
    * conditions pre-computed as much as possible. The same object is then
    * re-used (matchRecurse) a lot
@@ -842,26 +842,25 @@ public class VolcanoRuleCall extends RelOptRuleCall {
   public static class MatchNonFirstRel extends OperandMatch {
     RelOpMatchInfo relOpMatchInfo;
     int relIndex;
+    int previousOperandOrdinal; // the previous matched rel operand ordinal in rule
 
-    public MatchNonFirstRel(RelOptRuleOperand operand, Set<Integer> assigned) {
+    public MatchNonFirstRel(RelOptRuleOperand operand, Set<Integer> assigned, int previousOperandOrdinal) {
       super(operand);
       relOpMatchInfo = new RelOpMatchInfo(operand, assigned);
       relIndex = getRelIndex(operand);
+      this.previousOperandOrdinal = previousOperandOrdinal;
     }
 
     @Override
     public void matchRecurse(VolcanoRuleCall rc, int solve) {
-      OperandMatch previousOp = rc.operand0.solveOrder.get(solve - 1);
-      final int operandOrdinal = getOperandOrdInRule();
-      final int previousOperandOrdinal = previousOp.getOperandOrdInRule();
-
       RelOpMatchInfoRuntime runtimeInfo = relOpMatchInfo.compileRuntime(rc);
       if (runtimeInfo == null) {
         return;
       }
 
+      final int operandOrdinal = getOperandOrdInRule();
       boolean ascending = operandOrdinal < previousOperandOrdinal;
-      final RelOptRuleOperand previousOperand = previousOp.operand;
+      final RelOptRuleOperand previousOperand = rc.operand0.getRule().operands.get(previousOperandOrdinal);
       final RelNode previous = rc.rels[getRelIndex(previousOperand)];
 
       final RelOptRuleOperand parentOperand;

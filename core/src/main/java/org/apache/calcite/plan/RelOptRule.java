@@ -71,6 +71,17 @@ public abstract class RelOptRule {
   //~ Static fields/initializers ---------------------------------------------
   protected static final Logger LOGGER = CalciteTrace.getPlannerTracer();
 
+  // flags to turn optimizations on/off
+  // true: enable optimization in paper, false: disable optimization in paper
+  // when matching a rel node, prefer matching other rel nodes first, or connected TVRs first
+  boolean relMatchPreferRel = false;
+  // when matching a tvr node, prefer matching inter-TVR traits first, or connected rels first
+  boolean tvrMatchPreferTvr = false;
+  // when matching an intra-tvr edge, prefer matching connected Tvr first, or rel first
+  boolean tvrEdgePreferTvr = false;
+  // when matching an inter-tvr edge, prefer more connected tvr first, or less connected tvr first
+  boolean tvrPropertyEdgePreferMore = false;
+
   //~ Instance fields --------------------------------------------------------
 
   /**
@@ -130,6 +141,7 @@ public abstract class RelOptRule {
   public Collection<IdentityArrayList<TvrEdgeRelOptRuleOperand>>
       adjacentTimeEdges;
 
+  boolean isTvrRule;
   //~ Constructors -----------------------------------------------------------
 
   /**
@@ -211,6 +223,10 @@ public abstract class RelOptRule {
           + "' is not valid");
     }
     this.description = description;
+    this.isTvrRule = tvrOperands != null && !tvrOperands.isEmpty()
+            || tvrEdgeOperands != null && !tvrEdgeOperands.isEmpty()
+            || tvrPropertyEdgeOperands != null && !tvrPropertyEdgeOperands.isEmpty();
+
     this.operands = flattenOperands();
     assignSolveOrder();
   }
@@ -604,12 +620,21 @@ public abstract class RelOptRule {
     if (operand instanceof TvrRelOptRuleOperand) {
       TvrRelOptRuleOperand tvrOp = (TvrRelOptRuleOperand) operand;
 
-      tvrOp.tvrPropertyEdges.forEach(
-          propertyEdge -> assignRecursive(solveOrder, assigned, propertyEdge,
-              propertyEdgeMatch(propertyEdge, assigned)));
-      tvrOp.tvrChildren.forEach(
-          tvrEdgeOp -> assignRecursive(solveOrder, assigned, tvrEdgeOp,
-              tvrEdgeMatch(tvrEdgeOp, assigned)));
+      if (tvrMatchPreferTvr) {
+        tvrOp.tvrPropertyEdges.forEach(
+                propertyEdge -> assignRecursive(solveOrder, assigned, propertyEdge,
+                        propertyEdgeMatch(propertyEdge, assigned)));
+        tvrOp.tvrChildren.forEach(
+                tvrEdgeOp -> assignRecursive(solveOrder, assigned, tvrEdgeOp,
+                        tvrEdgeMatch(tvrEdgeOp, assigned)));
+      } else {
+        tvrOp.tvrChildren.forEach(
+                tvrEdgeOp -> assignRecursive(solveOrder, assigned, tvrEdgeOp,
+                        tvrEdgeMatch(tvrEdgeOp, assigned)));
+        tvrOp.tvrPropertyEdges.forEach(
+                propertyEdge -> assignRecursive(solveOrder, assigned, propertyEdge,
+                        propertyEdgeMatch(propertyEdge, assigned)));
+      }
       return;
     }
 
@@ -621,16 +646,31 @@ public abstract class RelOptRule {
         // A special treatment of op0 being a property edge
         assert assigned.size() == 1;
 
-        // Assign toTvr without expanding
-        assigned.add(propertyOp.getToTvrOp().ordinalInRule);
-        solveOrder.add(tvrMatch(propertyOp.getToTvrOp(), assigned));
+        if (tvrPropertyEdgePreferMore) {
+          // Assign toTvr without expanding
+          assigned.add(propertyOp.getToTvrOp().ordinalInRule);
+          solveOrder.add(tvrMatch(propertyOp.getToTvrOp(), assigned));
 
-        // Assign and expand fromTvr
-        assignRecursive(solveOrder, assigned, propertyOp.getFromTvrOp(),
-            tvrMatch(propertyOp.getFromTvrOp(), assigned));
+          // Assign and expand fromTvr
+          assignRecursive(solveOrder, assigned, propertyOp.getFromTvrOp(),
+                  tvrMatch(propertyOp.getFromTvrOp(), assigned));
 
-        // Expand toTvr
-        expandRecursive(solveOrder, assigned, propertyOp.getToTvrOp());
+          // Expand toTvr
+          expandRecursive(solveOrder, assigned, propertyOp.getToTvrOp());
+        } else {
+          // Assign fromTvr without expanding
+          assigned.add(propertyOp.getFromTvrOp().ordinalInRule);
+          solveOrder.add(tvrMatch(propertyOp.getFromTvrOp(), assigned));
+
+          // Assign and expand toTvr
+          assignRecursive(solveOrder, assigned, propertyOp.getToTvrOp(),
+                  tvrMatch(propertyOp.getToTvrOp(), assigned));
+
+          // Expand fromTvr
+          expandRecursive(solveOrder, assigned, propertyOp.getFromTvrOp());
+        }
+
+
         return;
       }
 
@@ -644,11 +684,24 @@ public abstract class RelOptRule {
 
     if (operand instanceof TvrEdgeRelOptRuleOperand) {
       TvrEdgeRelOptRuleOperand edgeOp = (TvrEdgeRelOptRuleOperand) operand;
-      // Try tvrOp immediately first
-      assignRecursive(solveOrder, assigned, edgeOp.getTvrOp(),
-          tvrMatch(edgeOp.getTvrOp(), assigned));
-      assignRecursive(solveOrder, assigned, edgeOp.getRelOp(),
-          firstRelMatch(edgeOp.getRelOp(), assigned));
+      if (tvrEdgePreferTvr) {
+        // Try tvrOp immediately first
+        assignRecursive(solveOrder, assigned, edgeOp.getTvrOp(),
+                tvrMatch(edgeOp.getTvrOp(), assigned));
+        assignRecursive(solveOrder, assigned, edgeOp.getRelOp(),
+                firstRelMatch(edgeOp.getRelOp(), assigned));
+      } else {
+        // match the TVR op, but don't expand from TVR op yet
+        if (! assigned.contains(edgeOp.getTvrOp().ordinalInRule)) {
+          assigned.add(edgeOp.getTvrOp().ordinalInRule);
+          solveOrder.add(tvrMatch(edgeOp.getTvrOp(), assigned));
+        }
+        // match and expand the rel op
+        assignRecursive(solveOrder, assigned, edgeOp.getRelOp(),
+                firstRelMatch(edgeOp.getRelOp(), assigned));
+        // expand the tvr op
+        expandRecursive(solveOrder, assigned, edgeOp.getTvrOp());
+      }
       return;
     }
 
@@ -661,35 +714,61 @@ public abstract class RelOptRule {
     RelOptRuleOperand root = null;
     List<TvrEdgeRelOptRuleOperand> tvrLinks =
         new ArrayList<>(operand.tvrParents);
+
+    // Expand to other trees from collected tvr links
+    if (! relMatchPreferRel) {
+      tvrLinks.forEach(
+              tvrEdgeOp -> assignRecursive(solveOrder, assigned, tvrEdgeOp,
+                      tvrEdgeMatch(tvrEdgeOp, assigned)));
+    }
+
+    // travel up to root
+    int prevRelOperandOrdinal = operand.ordinalInRule;
     for (RelOptRuleOperand o = operand; o != null; o = o.getParent()) {
-      assignNonFirstRelOperand(solveOrder, assigned, tvrLinks, o);
       root = o;
+      if (assigned.contains(o.ordinalInRule)) {
+        continue;
+      }
+      assigned.add(o.ordinalInRule);
+      solveOrder.add(nonFirstRelMatch(o, assigned, prevRelOperandOrdinal));
+      tvrLinks.addAll(o.tvrParents);
+      expandRecursive(solveOrder, assigned, o);
+      prevRelOperandOrdinal = o.ordinalInRule;
     }
 
     int endingOrdinalForRoot = endingOrdinalInRuleForTree(root);
     for (int k = root.ordinalInRule; k < endingOrdinalForRoot; k++) {
       RelOptRuleOperand o = operands.get(k);
-      assignNonFirstRelOperand(solveOrder, assigned, tvrLinks, o);
+      if (assigned.contains(o.ordinalInRule)) {
+        continue;
+      }
+      assigned.add(o.ordinalInRule);
+      solveOrder.add(nonFirstRelMatch(o, assigned, prevRelOperandOrdinal));
+      tvrLinks.addAll(o.tvrParents);
+      expandRecursive(solveOrder, assigned, o);
+      prevRelOperandOrdinal = o.ordinalInRule;
     }
 
-    // Expand to other trees from collected tvr links
-    tvrLinks.forEach(
-        tvrEdgeOp -> assignRecursive(solveOrder, assigned, tvrEdgeOp,
-            tvrEdgeMatch(tvrEdgeOp, assigned)));
-  }
-
-  private void assignNonFirstRelOperand(List<OperandMatch> solveOrder,
-      Set<Integer> assigned, List<TvrEdgeRelOptRuleOperand> tvrLinks,
-      RelOptRuleOperand operand) {
-    if (assigned.contains(operand.ordinalInRule)) {
-      return;
+    if (relMatchPreferRel) {
+      tvrLinks.forEach(
+              tvrEdgeOp -> assignRecursive(solveOrder, assigned, tvrEdgeOp,
+                      tvrEdgeMatch(tvrEdgeOp, assigned)));
     }
-    assigned.add(operand.ordinalInRule);
-    solveOrder.add(nonFirstRelMatch(operand, assigned));
 
-    // Remember all tvr edges coming out of this operand
-    tvrLinks.addAll(operand.tvrParents);
   }
+
+//  private void assignNonFirstRelOperand(List<OperandMatch> solveOrder,
+//      Set<Integer> assigned, List<TvrEdgeRelOptRuleOperand> tvrLinks,
+//      RelOptRuleOperand operand) {
+//    if (assigned.contains(operand.ordinalInRule)) {
+//      return;
+//    }
+//    assigned.add(operand.ordinalInRule);
+//    solveOrder.add(nonFirstRelMatch(operand, assigned, 0));
+//
+//    // Remember all tvr edges coming out of this operand
+//    tvrLinks.addAll(operand.tvrParents);
+//  }
 
   private OperandMatch operandZeroMatch(RelOptRuleOperand op0,
       Set<Integer> assigned) {
@@ -711,8 +790,8 @@ public abstract class RelOptRule {
   }
 
   private OperandMatch nonFirstRelMatch(RelOptRuleOperand relOp,
-      Set<Integer> assigned) {
-    return new MatchNonFirstRel(relOp, assigned);
+      Set<Integer> assigned, int prevOperandOrdinal) {
+    return new MatchNonFirstRel(relOp, assigned, prevOperandOrdinal);
   }
 
   private OperandMatch tvrMatch(TvrRelOptRuleOperand tvrOp,
