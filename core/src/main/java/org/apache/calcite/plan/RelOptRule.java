@@ -572,28 +572,32 @@ public abstract class RelOptRule {
   /**
    * Builds each operand's solve-order.
    */
-  private void assignSolveOrder() {
+  public void assignSolveOrder() {
     LOGGER.trace("Printing solveOrder for {}", this.description);
     for (RelOptRuleOperand operand : operands) {
       LOGGER.trace("Ordinal {} {}, match class {}", operand.ordinalInRule,
           operand.getClass(), operand.getMatchedClass());
     }
-    int i = 0;
-    for (RelOptRuleOperand operand : operands) {
-      operand.solveOrder = new ArrayList<>();
-      Set<Integer> assigned = new HashSet<>();
-      assignRecursive(operand.solveOrder, assigned, operand,
-          operandZeroMatch(operand, assigned));
-      assert operand.solveOrder.size() == operands.size();
 
-      if (LOGGER.isTraceEnabled()) {
-        StringBuilder sb = new StringBuilder("Operand ").append(i).append(" solve order: ");
-        for (OperandMatch opMatch : operand.solveOrder) {
-          sb.append(opMatch.getOperandOrdInRule()).append(", ");
-        }
-        i++;
-        LOGGER.trace(sb.toString());
+    for (int i = 0; i < operands.size(); i++) {
+      assignSolveOrder(i);
+    }
+  }
+
+  public void assignSolveOrder(int i) {
+    RelOptRuleOperand operand = operands.get(i);
+    operand.solveOrder = new ArrayList<>();
+    Set<Integer> assigned = new HashSet<>();
+    assignRecursive(operand.solveOrder, assigned, operand,
+            operandZeroMatch(operand, assigned));
+    assert operand.solveOrder.size() == operands.size();
+
+    if (LOGGER.isTraceEnabled()) {
+      StringBuilder sb = new StringBuilder("Operand ").append(i).append(" solve order: ");
+      for (OperandMatch opMatch : operand.solveOrder) {
+        sb.append(opMatch.getOperandOrdInRule()).append(", ");
       }
+      LOGGER.trace(sb.toString());
     }
   }
 

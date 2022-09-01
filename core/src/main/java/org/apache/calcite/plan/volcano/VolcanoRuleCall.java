@@ -53,7 +53,7 @@ import static org.apache.calcite.plan.volcano.VolcanoPlanner.equivRoot;
  */
 public class VolcanoRuleCall extends RelOptRuleCall {
 
-  public static boolean preCompileRulePattern = true ;
+  public static boolean preCompileRulePattern = false;
 
   /**
    * Rule match template for a {@link RelOptRuleOperand} in a solve order of a
@@ -1179,6 +1179,10 @@ public class VolcanoRuleCall extends RelOptRuleCall {
     }
 
     public void compile() {
+      if (! preCompileRulePattern) {
+        operand.getRule().assignSolveOrder(this.operand.ordinalInRule);
+      }
+
       this.tvr2TraitMap = new HashMap<>();
       this.tvrsFortvrTypeInclude = new HashSet<>();
       this.hasTvrTypeRequirement = operand.tvrParents.stream()
