@@ -170,15 +170,15 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
   private final List<TvrEdgeRelOptRuleOperand> tvrEdgeOperands = new ArrayList<>();
   private final List<TvrPropertyEdgeRuleOperand> tvrPropertyEdgeOperands = new ArrayList<>();
 
-  private final Multimap<Class<? extends TvrSemantics>,
-      TvrEdgeRelOptRuleOperand>
-      tvrEdgeToOperands = LinkedListMultimap.create();
-  private final Multimap<Class<? extends TvrProperty>,
-      TvrPropertyEdgeRuleOperand>
-      tvrPropertyEdgeToOperands = LinkedListMultimap.create();
+  private final Map<Class<? extends TvrSemantics>,
+      List<TvrEdgeRelOptRuleOperand>>
+      tvrEdgeToOperands = new HashMap<>();
+  private final Map<Class<? extends TvrProperty>,
+          List<TvrPropertyEdgeRuleOperand>>
+      tvrPropertyEdgeToOperands = new HashMap<>();
 
-  private final Multimap<Class<? extends TvrSemantics>, TvrConvertMatchPattern>
-      tvrConvertMatchPatterns = LinkedListMultimap.create();
+  private final Map<Class<? extends TvrSemantics>, List<TvrConvertMatchPattern>>
+      tvrConvertMatchPatterns = new HashMap<>();
 
   private final Set<TvrMetaSet> hasDelayedTvrConverters = new LinkedHashSet<>();
 
@@ -531,14 +531,22 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
             Util.filter(knownTvrEdgeClasses,
                 op.getMatchedTvrClass()::isAssignableFrom);
         tvrEdgeOperands.add(op);
-        subClasses.forEach(c -> tvrEdgeToOperands.put(c, op));
+        subClasses.forEach(c -> {
+          List<TvrEdgeRelOptRuleOperand> l = tvrEdgeToOperands.getOrDefault(c, new ArrayList<>());
+          l.add(op);
+          tvrEdgeToOperands.put(c, l);
+        });
       } else if (operand instanceof TvrPropertyEdgeRuleOperand) {
         TvrPropertyEdgeRuleOperand op = (TvrPropertyEdgeRuleOperand) operand;
         Iterable<Class<? extends TvrProperty>> subClasses =
             Util.filter(knownTvrPropertyClasses,
                 op.getMatchedPropertyClass()::isAssignableFrom);
         tvrPropertyEdgeOperands.add(op);
-        subClasses.forEach(c -> tvrPropertyEdgeToOperands.put(c, op));
+        subClasses.forEach(c -> {
+          List<TvrPropertyEdgeRuleOperand> l = tvrPropertyEdgeToOperands.getOrDefault(c, new ArrayList<>());
+          l.add(op);
+          tvrPropertyEdgeToOperands.put(c, l);
+        });
       } else {
         for (Class<? extends RelNode> subClass : subClasses(
             operand.getMatchedClass())) {
@@ -552,7 +560,11 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
       pattern.getRelatedTvrClasses().forEach(clazz -> {
         Iterable<Class<? extends TvrSemantics>> subClasses =
             Util.filter(knownTvrEdgeClasses, clazz::isAssignableFrom);
-        subClasses.forEach(c -> tvrConvertMatchPatterns.put(c, pattern));
+        subClasses.forEach(c -> {
+          List<TvrConvertMatchPattern> l = tvrConvertMatchPatterns.getOrDefault(c, new ArrayList<>());
+          l.add(pattern);
+          tvrConvertMatchPatterns.put(c, l);
+        });
       });
     }
 
@@ -630,7 +642,9 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
           TvrEdgeRelOptRuleOperand op = (TvrEdgeRelOptRuleOperand) operand;
           if (op.getMatchedTvrClass().isAssignableFrom(clazz)) {
             tvrEdgeOperands.add(op);
-            tvrEdgeToOperands.put(clazz, op);
+            List<TvrEdgeRelOptRuleOperand> l = tvrEdgeToOperands.getOrDefault(clazz, new ArrayList<>());
+            l.add(op);
+            tvrEdgeToOperands.put(clazz, l);
           }
         }
 
@@ -638,7 +652,9 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
           TvrConvertMatchPattern pattern = (TvrConvertMatchPattern) rule;
           if (pattern.getRelatedTvrClasses().stream()
               .anyMatch(cl -> cl.isAssignableFrom(clazz))) {
-            tvrConvertMatchPatterns.put(clazz, pattern);
+            List<TvrConvertMatchPattern> l = tvrConvertMatchPatterns.getOrDefault(clazz, new ArrayList<>());
+            l.add(pattern);
+            tvrConvertMatchPatterns.put(clazz, l);
           }
         }
       }
@@ -657,7 +673,9 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
           TvrPropertyEdgeRuleOperand op = (TvrPropertyEdgeRuleOperand) operand;
           if (op.getMatchedPropertyClass().isAssignableFrom(clazz)) {
             tvrPropertyEdgeOperands.add(op);
-            tvrPropertyEdgeToOperands.put(clazz, op);
+            List<TvrPropertyEdgeRuleOperand> l = tvrPropertyEdgeToOperands.getOrDefault(clazz, new ArrayList<>());
+            l.add(op);
+            tvrPropertyEdgeToOperands.put(clazz, l);
           }
         }
       }
@@ -1746,50 +1764,94 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
 
   void fireRules(TvrMetaSet tvr, TvrSemantics tvrKey, RelSet set,
       boolean deferred) {
-    Collection<TvrEdgeRelOptRuleOperand> edgeOps;
     if (indexTvrStaticProperties) {
-      edgeOps = tvrEdgeToOperands.get(tvrKey.getClass());
-    } else {
-      edgeOps = tvrEdgeOperands;
-    }
-    for (TvrEdgeRelOptRuleOperand edgeOp : edgeOps) {
-      if (!ruleQueue.active(edgeOp.getRule())) {
-        continue;
-      }
-      if (edgeOp.matches(tvrKey)) {
-        final VolcanoRuleCall ruleCall;
-        if (deferred) {
-          ruleCall = new DeferringRuleCall(this, edgeOp);
-        } else {
-          ruleCall = new VolcanoRuleCall(this, edgeOp);
+      Collection<TvrEdgeRelOptRuleOperand> edgeOps = tvrEdgeToOperands.get(tvrKey.getClass());
+      for (TvrEdgeRelOptRuleOperand edgeOp : edgeOps) {
+        if (!ruleQueue.active(edgeOp.getRule())) {
+          continue;
         }
-        ruleCall.match(tvr, tvrKey, set);
+        if (edgeOp.matches(tvrKey)) {
+          final VolcanoRuleCall ruleCall;
+          if (deferred) {
+            ruleCall = new DeferringRuleCall(this, edgeOp);
+          } else {
+            ruleCall = new VolcanoRuleCall(this, edgeOp);
+          }
+          ruleCall.match(tvr, tvrKey, set);
+        }
+      }
+    } else {
+      Collection<RelOptRuleOperand> ops = new ArrayList<>();
+      ops.addAll(tvrOperands);
+      ops.addAll(tvrEdgeOperands);
+      ops.addAll(tvrPropertyEdgeOperands);
+      ops.addAll(classOperands.values());
+
+      for (RelOptRuleOperand op : ops) {
+        if (!ruleQueue.active(op.getRule())) {
+          continue;
+        }
+        if (! (op instanceof TvrEdgeRelOptRuleOperand)) {
+          continue;
+        }
+        TvrEdgeRelOptRuleOperand edgeOp = (TvrEdgeRelOptRuleOperand) op;
+        if (edgeOp.matches(tvrKey)) {
+          final VolcanoRuleCall ruleCall;
+          if (deferred) {
+            ruleCall = new DeferringRuleCall(this, edgeOp);
+          } else {
+            ruleCall = new VolcanoRuleCall(this, edgeOp);
+          }
+          ruleCall.match(tvr, tvrKey, set);
+        }
       }
     }
   }
 
   void fireRules(TvrMetaSet fromTvr, TvrMetaSet toTvr, TvrProperty tvrProperty,
       boolean deferred) {
-    Collection<TvrPropertyEdgeRuleOperand> propertyOps;
     if (indexTvrStaticProperties) {
-      propertyOps = tvrPropertyEdgeToOperands.get(tvrProperty.getClass());
-    } else {
-      propertyOps = tvrPropertyEdgeOperands;
-    }
-    for (TvrPropertyEdgeRuleOperand propertyOp : propertyOps) {
-      if (!ruleQueue.active(propertyOp.getRule())) {
-        continue;
-      }
-      if (propertyOp.matches(tvrProperty)) {
-        final VolcanoRuleCall ruleCall;
-        if (deferred) {
-          ruleCall = new DeferringRuleCall(this, propertyOp);
-        } else {
-          ruleCall = new VolcanoRuleCall(this, propertyOp);
+      Collection<TvrPropertyEdgeRuleOperand> propertyOps = tvrPropertyEdgeToOperands.get(tvrProperty.getClass());
+      for (TvrPropertyEdgeRuleOperand propertyOp : propertyOps) {
+        if (!ruleQueue.active(propertyOp.getRule())) {
+          continue;
         }
-        ruleCall.match(fromTvr, toTvr, tvrProperty);
+        if (propertyOp.matches(tvrProperty)) {
+          final VolcanoRuleCall ruleCall;
+          if (deferred) {
+            ruleCall = new DeferringRuleCall(this, propertyOp);
+          } else {
+            ruleCall = new VolcanoRuleCall(this, propertyOp);
+          }
+          ruleCall.match(fromTvr, toTvr, tvrProperty);
+        }
+      }
+    } else {
+      Collection<RelOptRuleOperand> ops = new ArrayList<>();
+      ops.addAll(tvrOperands);
+      ops.addAll(tvrEdgeOperands);
+      ops.addAll(tvrPropertyEdgeOperands);
+      ops.addAll(classOperands.values());
+      for (RelOptRuleOperand op : ops) {
+        if (!ruleQueue.active(op.getRule())) {
+          continue;
+        }
+        if (! (op instanceof TvrPropertyEdgeRuleOperand)) {
+          continue;
+        }
+        TvrPropertyEdgeRuleOperand propertyOp = (TvrPropertyEdgeRuleOperand) op;
+        if (propertyOp.matches(tvrProperty)) {
+          final VolcanoRuleCall ruleCall;
+          if (deferred) {
+            ruleCall = new DeferringRuleCall(this, propertyOp);
+          } else {
+            ruleCall = new VolcanoRuleCall(this, propertyOp);
+          }
+          ruleCall.match(fromTvr, toTvr, tvrProperty);
+        }
       }
     }
+
   }
 
   private boolean fixUpInputs(RelNode rel) {
