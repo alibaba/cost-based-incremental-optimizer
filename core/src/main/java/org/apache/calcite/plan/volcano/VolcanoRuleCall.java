@@ -53,6 +53,8 @@ import static org.apache.calcite.plan.volcano.VolcanoPlanner.equivRoot;
  */
 public class VolcanoRuleCall extends RelOptRuleCall {
 
+  public static boolean preCompileRulePattern = true ;
+
   /**
    * Rule match template for a {@link RelOptRuleOperand} in a solve order of a
    * {@link }. The OperandMatch is compiled once at the time of
@@ -1160,8 +1162,9 @@ public class VolcanoRuleCall extends RelOptRuleCall {
    */
   private static class RelOpMatchInfo {
     RelOptRuleOperand operand;
-    Map<Integer, Integer> tvr2TraitMap;
-    Set<Integer> tvrsFortvrTypeInclude;
+    Set<Integer> assigned;
+    Map<Integer, Integer> tvr2TraitMap = new HashMap<>();;
+    Set<Integer> tvrsFortvrTypeInclude = new HashSet<>();;
 
     // If this is true, the matched relNode should have a non-null
     // volcanoPlanner.tvrGenericRels entry
@@ -1169,17 +1172,24 @@ public class VolcanoRuleCall extends RelOptRuleCall {
 
     RelOpMatchInfo(RelOptRuleOperand operand, Set<Integer> assigned) {
       this.operand = operand;
+      this.assigned = new HashSet<>(assigned);
+      if (preCompileRulePattern) {
+        compile();
+      }
+    }
+
+    public void compile() {
       this.tvr2TraitMap = new HashMap<>();
       this.tvrsFortvrTypeInclude = new HashSet<>();
       this.hasTvrTypeRequirement = operand.tvrParents.stream()
-          .anyMatch(TvrEdgeRelOptRuleOperand::enforceTvrType);
+              .anyMatch(TvrEdgeRelOptRuleOperand::enforceTvrType);
 
       // Look at the tvr edges to this operand that's already matched, and
       // figure out the RelSet this operand should find its match in, as well
       // as required TvrMetaSetType.
       for (TvrEdgeRelOptRuleOperand tvrEdge : operand.tvrParents) {
         boolean tvrAssigned =
-            assigned.contains(tvrEdge.getTvrOp().ordinalInRule);
+                assigned.contains(tvrEdge.getTvrOp().ordinalInRule);
         boolean tvrTraitAssigned = assigned.contains(tvrEdge.ordinalInRule);
 
         if (tvrAssigned && tvrEdge.enforceTvrType()) {
@@ -1188,15 +1198,20 @@ public class VolcanoRuleCall extends RelOptRuleCall {
 
         if (tvrTraitAssigned && tvrAssigned) {
           tvr2TraitMap
-              .put(getTvrIndex(tvrEdge.tvrOp), getTvrEdgeIndex(tvrEdge));
+                  .put(getTvrIndex(tvrEdge.tvrOp), getTvrEdgeIndex(tvrEdge));
         }
       }
     }
+
 
     /**
      * Compute matchInfoRuntime. Returns null when there's no possible match.
      */
     RelOpMatchInfoRuntime compileRuntime(VolcanoRuleCall rc) {
+      if (! preCompileRulePattern) {
+        compile();
+      }
+
       RelSet set = null;
       Set<TvrMetaSetType> tvrTypesInclude = new HashSet<>();
 
