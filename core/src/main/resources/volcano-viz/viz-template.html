@@ -186,12 +186,8 @@
         // create nodes and sets
         for (var setID in ruleMatchInfo.nodesInSet) {
             // add set
-            var setLabel = ruleMatchInfo.setLabels[setID];
-            if (setLabel === null || setLabel === undefined) {
-                setLabel = setID;
-            }
             g.setNode(setID, {
-                label: setLabel,
+                label: setID,
                 clusterLabelPos: 'top'
             });
             // add nodes and node-set parent relationship
@@ -256,6 +252,17 @@
             popupContent += "<br>Added in Rule - "  + nodeAddedInRule[nodeID];
 
             tippy(nodeElement, { content: popupContent })
+            i++;
+        });
+
+        const allD3Clusters = d3.select('svg').selectAll('.cluster');
+        const allD3ClusterElements = allD3Clusters.nodes();
+
+        i = 0;
+        allD3Clusters.each(setID => {
+            var setElement = allD3ClusterElements[i];
+            var popupContent = ruleMatchInfo.setLabels[setID];
+            tippy(setElement, { content: popupContent })
             i++;
         });
     }

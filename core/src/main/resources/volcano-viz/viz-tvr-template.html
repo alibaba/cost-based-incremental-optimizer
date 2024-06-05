@@ -212,8 +212,13 @@
                 });
             }
 
+            var tvrPopupContent = "";
+            for (var tvrSemantics in tvrInfo.tvrSets) {
+                tvrPopupContent += tvrSemantics + " - " + tvrInfo.tvrSets[tvrSemantics] + "\n";
+            }
+
             g.setNode(tvrId, {
-                label: tvrLabel,
+                label: tvrLabel + "\n" + tvrPopupContent,
                 clusterLabelPos: 'top'
             });
         });

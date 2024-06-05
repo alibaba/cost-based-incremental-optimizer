@@ -208,12 +208,12 @@ public class VolcanoRuleMatchVisualizer {
 
   private String getSetLabel(RelSet set) {
     StringBuilder sb = new StringBuilder();
-    sb.append("set-").append(set.id).append("    ");
+    sb.append("set-").append(set.id).append("<br>");
 
     String tvrLinksStr = set.tvrLinks.asMap().entrySet().stream().map(
-        e -> e.getKey() + "-[" + e.getValue().stream()
-            .map(metaSet -> Integer.toString(metaSet.tvrId))
-            .collect(joining(",")) + "]").collect(joining(", "));
+        e -> e.getKey() + " --> [" + e.getValue().stream()
+            .map(metaSet -> "tvr#" + metaSet.tvrId)
+            .collect(joining(",")) + "]").collect(joining("<br>"));
 
     sb.append(tvrLinksStr);
 
